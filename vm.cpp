@@ -23,6 +23,13 @@ static const std::filesystem::path default_ini_path = vm_root / "default.ini";
 static auto default_ini = std::shared_ptr<dictionary>(std::filesystem::exists(default_ini_path)? iniparser_load(default_ini_path.c_str()) : dictionary_new(0), iniparser_freedict);
 static const char* default_bridge = iniparser_getstring(default_ini.get(), ":bridge", std::filesystem::exists("/sys/class/net/br0/bridge")? "br0" : NULL);
 
+class Finally {
+    std::function<void()> func;
+public:
+    Finally(std::function<void()> _func) : func(_func) {}
+    ~Finally() { func(); }
+};
+
 std::vector<std::string> getopt(
     int argc, char* argv[], 
     const std::vector<std::tuple<
@@ -106,7 +113,9 @@ void create_bootimage(const std::filesystem::path& bootimage_path, const std::st
     std::filesystem::copy("/usr/lib/grub/i386-pc/boot.img", bootimage_path, std::filesystem::copy_options::overwrite_existing);
 
     std::filesystem::path memdisk_tar = bootimage_dir / "memdisk.tar";
-    try {
+    Finally memdisk_tar_fin([&memdisk_tar]{if (std::filesystem::exists(memdisk_tar)) std::filesystem::remove(memdisk_tar);});
+
+    {
         std::ofstream f(memdisk_tar, std::ios::binary|std::ios::trunc);
         if (!f) throw std::runtime_error("memdisk.tar cannot be created");
 
@@ -119,7 +128,7 @@ void create_bootimage(const std::filesystem::path& bootimage_path, const std::st
         grub_cfg << "  set root=(hd1)" << std::endl;
         grub_cfg << "  source /boot/grub/grub.cfg" << std::endl;
         grub_cfg << "elif [ -f (hd1)/boot/kernel ]; then" << std::endl;
-        grub_cfg << "  linux (hd1)/boot/kernel net.ifnames=0 console=ttyS0,115200n8r console=tty0 systemd.hostname=$hostname systemd.firstboot=0" << std::endl;
+        grub_cfg << "  linux (hd1)/boot/kernel net.ifnames=0 console=tty0 console=ttyS0,115200n8r systemd.hostname=$hostname systemd.firstboot=0" << std::endl;
         grub_cfg << "  initrd (hd1)/boot/initramfs" << std::endl;
         grub_cfg << "  boot" << std::endl;
         grub_cfg << "fi" << std::endl;
@@ -171,13 +180,10 @@ void create_bootimage(const std::filesystem::path& bootimage_path, const std::st
         f.write(pad, block_size);
         f.write(pad, block_size);
     }
-    catch (...) {
-        if (std::filesystem::exists(memdisk_tar)) std::filesystem::remove(memdisk_tar);
-        throw;
-    }
 
     int fd = open(bootimage_path.c_str(), O_APPEND|O_WRONLY);
     if (fd < 0) throw std::runtime_error("open(bootimage_path, O_APPEND) failed");
+    Finally fd_fin([fd]{close(fd);});
 
     auto pid = fork();
     if (pid < 0) throw std::runtime_error("fork() failed");
@@ -194,20 +200,20 @@ void create_bootimage(const std::filesystem::path& bootimage_path, const std::st
     // else(main process)
     int wstatus;
     waitpid(pid, &wstatus, 0);
-    std::filesystem::remove(memdisk_tar);
-    if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) {
-        close(fd);
-        std::filesystem::remove(bootimage_path);
-        throw std::runtime_error("grub-mkimage failed");
-    }
-    if (lseek(fd, 0, SEEK_END) < 512 * 1024) {
-        if (ftruncate(fd, 512 * 1024) < 0) {
-            close(fd);
-            std::filesystem::remove(bootimage_path);
-            throw std::runtime_error("ftruncate() failed");
+    try {
+        if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) {
+            throw std::runtime_error("grub-mkimage failed");
+        }
+        if (lseek(fd, 0, SEEK_END) < 512 * 1024) {
+            if (ftruncate(fd, 512 * 1024) < 0) {
+                throw std::runtime_error("ftruncate() failed");
+            }
         }
     }
-    close(fd);
+    catch (...) {
+        std::filesystem::remove(bootimage_path);
+        throw;
+    }
 }
 
 bool validate_mac_address(const std::string& mac_str)
@@ -300,13 +306,13 @@ int vm(const std::string& name)
             continue;
         }
         //else
-        sprintf(buf, "fs%d:socket", i);
-        auto socket = iniparser_getstring(ini.get(), buf, NULL);
-        if (!socket) {
-            std::cerr << "Socket is not specified for fs " << i << ". fs ignored." << std::endl;
+        sprintf(buf, "fs%d:path", i);
+        auto path = iniparser_getstring(ini.get(), buf, NULL);
+        if (!path) {
+            std::cerr << "Path is not specified for fs " << i << ". fs ignored." << std::endl;
             continue;
         }
-        virtiofses.push_back({tag, socket});
+        virtiofses.push_back({tag, path});
     }
 
     // load USB config
@@ -367,13 +373,16 @@ int vm(const std::string& name)
         qemu_cmdline.push_back("virtio-rng-pci");
     }
 
-    int chardev = 0;
+    int chardev_idx = 0;
+    std::vector<std::pair<std::filesystem::path,std::filesystem::path>> virtiofs_sockets;
     for (const auto& fs:virtiofses) {
+        auto socket_path = run_dir / ("virtiofs" + std::to_string(chardev_idx) + ".sock");
+        auto chardev = std::string("char") + std::to_string(chardev_idx++);
         qemu_cmdline.push_back("-chardev");
-        qemu_cmdline.push_back(std::string("socket,id=char") + std::to_string(chardev) + ",path=" + fs.second.string());
+        qemu_cmdline.push_back("socket,id=" + chardev + ",path=" + socket_path.string());
         qemu_cmdline.push_back("-device");
-        qemu_cmdline.push_back(std::string("vhost-user-fs-pci,queue-size=1024,chardev=char") + std::to_string(chardev) + ",tag=" + fs.first);
-        chardev++;
+        qemu_cmdline.push_back("vhost-user-fs-pci,queue-size=1024,chardev=" + chardev + ",tag=" + fs.first);
+        virtiofs_sockets.push_back({fs.second, socket_path});
     }
 
     auto boot_image = run_dir / "boot.img";
@@ -402,33 +411,58 @@ int vm(const std::string& name)
     std::filesystem::create_directories(run_dir);
     auto run_dir_fd = open(run_dir.c_str(), O_RDONLY, 0);
     if (run_dir_fd < 0) throw std::runtime_error(std::string("open(") + run_dir.string() + ") failed");
+    Finally run_dir_fd_fin([run_dir_fd]{close(run_dir_fd);});
     if (flock(run_dir_fd, LOCK_EX|LOCK_NB) < 0) {
-        close(run_dir_fd);
         if (errno == EWOULDBLOCK) throw std::runtime_error(name + " is already running");
         else throw std::runtime_error(std::string("flock(") + run_dir.string() + ") failed");
     }
+    Finally run_dir_fd_lock_fin([run_dir_fd]{flock(run_dir_fd, LOCK_UN);});
 
-    try {
-        create_bootimage(boot_image, name);
-    }
-    catch (...) {
-        flock(run_dir_fd, LOCK_UN);
-        close(run_dir_fd);
-        throw;
+    create_bootimage(boot_image, name);
+
+    // run virtiofsds
+    // needs patch series: https://patchwork.kernel.org/project/qemu-devel/cover/20200730194736.173994-1-vgoyal@redhat.com/
+    std::vector<pid_t> virtiofsd_pids;
+    Finally virtiofsd_fin([&virtiofsd_pids]{
+        for (auto pid:virtiofsd_pids) {
+            std::cout << "Terminating virtiofs at pid=" << pid << std::endl;
+            kill(pid, SIGTERM);
+        }
+        for (auto pid:virtiofsd_pids) {
+            waitpid(pid, NULL, 0);
+        }
+    });
+    for (const auto& i:virtiofs_sockets) {
+        const auto& source = i.first;
+        const auto& socket_path = i.second;
+        std::cout << socket_path << std::endl;
+        auto pid = fork();
+        if (pid < 0) throw std::runtime_error("fork() failed");
+        if (pid == 0) {
+            _exit(execlp("/usr/libexec/virtiofsd", "/usr/libexec/virtiofsd", 
+                "-f", "-o", ("cache=none,flock,posix_lock,xattr,allow_direct_io,source=" + source.string()).c_str(),
+                ("--socket-path=" + socket_path.string()).c_str(),
+                NULL));
+        }
+        //else
+        virtiofsd_pids.push_back(pid);
     }
 
-    char ** argv = new char *[qemu_cmdline.size() + 1];
-    for (int i = 0; i < qemu_cmdline.size(); i++) {
-        argv[i] = strdup(qemu_cmdline[i].c_str());
+    auto pid = fork();
+    if (pid < 0) throw std::runtime_error("fork() failed");
+    if (pid == 0) { // child process
+        char ** argv = new char *[qemu_cmdline.size() + 1];
+        for (int i = 0; i < qemu_cmdline.size(); i++) {
+            argv[i] = strdup(qemu_cmdline[i].c_str());
+        }
+        argv[qemu_cmdline.size()] = NULL;
+        _exit(execvp(qemu_cmdline[0].c_str(), argv));
     }
-    argv[qemu_cmdline.size()] = NULL;
-    auto rst = execvp(qemu_cmdline[0].c_str(), argv);
+    int wstatus;
+    waitpid(pid, &wstatus, 0);
 
-    // assume rst < 0
-    flock(run_dir_fd, LOCK_UN);
-    close(run_dir_fd);
-    delete []argv;
-    return rst;
+    std::cout << "VM ended" << std::endl;
+    return WIFEXITED(wstatus)? WEXITSTATUS(wstatus) : -1;
 }
 
 void usage(const std::string& progname)
