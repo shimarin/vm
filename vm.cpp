@@ -124,11 +124,13 @@ void create_bootimage(const std::filesystem::path& bootimage_path, const std::st
         grub_cfg << "terminal_input serial console" << std::endl;
         grub_cfg << "terminal_output serial console" << std::endl;
         grub_cfg << "set hostname=\"" << hostname << '"' << std::endl;
+        grub_cfg << "set hostuid=\"" << getuid() << '"' << std::endl;
+        grub_cfg << "set hostgid=\"" << getgid() << '"' << std::endl;
         grub_cfg << "if [ -f (hd1)/boot/grub/grub.cfg ]; then" << std::endl;
         grub_cfg << "  set root=(hd1)" << std::endl;
         grub_cfg << "  source /boot/grub/grub.cfg" << std::endl;
         grub_cfg << "elif [ -f (hd1)/boot/kernel ]; then" << std::endl;
-        grub_cfg << "  linux (hd1)/boot/kernel net.ifnames=0 console=tty0 console=ttyS0,115200n8r systemd.hostname=$hostname systemd.firstboot=0" << std::endl;
+        grub_cfg << "  linux (hd1)/boot/kernel net.ifnames=0 console=tty0 console=ttyS0,115200n8r systemd.hostname=$hostname systemd.firstboot=0 hostuid=$hostuid hostgid=$hostgid" << std::endl;
         grub_cfg << "  initrd (hd1)/boot/initramfs" << std::endl;
         grub_cfg << "  boot" << std::endl;
         grub_cfg << "fi" << std::endl;
