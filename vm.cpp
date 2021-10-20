@@ -275,6 +275,27 @@ std::string get_or_generate_mac_address(const std::string& vmname, int num)
     return mac_str;
 }
 
+static void create_data_image(const std::filesystem::path& data_image_path)
+{
+    auto fd = creat(data_image_path.c_str(), S_IRUSR|S_IWUSR);
+    if (fd < 0) throw std::runtime_error("creat() failed");
+    if (ftruncate(fd, 1024 * 1024 * 1024/*1GiB*/) < 0) {
+        close(fd);
+        throw std::runtime_error("Createing data image failed");
+    }
+    close(fd);
+    //else
+    auto pid = fork();
+    if (pid < 0) throw std::runtime_error("fork() failed");
+    if (pid == 0) {
+        _exit(execlp("mkfs.btrfs", "mkfs.btrfs", "-f", data_image_path.c_str(), NULL));
+    }
+    // else(main process)
+    int wstatus;
+    waitpid(pid, &wstatus, 0);
+    if (!WIFEXITED(wstatus) || WEXITSTATUS(wstatus) != 0) throw std::runtime_error("mkfs.btrfs failed");
+}
+
 int vm(const std::string& name)
 {
     auto vm_dir = vm_root / name, run_dir = run_root / name;
@@ -283,7 +304,11 @@ int vm(const std::string& name)
 
     auto system_image = vm_dir / "system", data_image = vm_dir / "data", swapfile = vm_dir / "swapfile", cdrom = vm_dir / "cdrom";
     if (!std::filesystem::exists(system_image)) throw std::runtime_error("No system image found");
-    if (!std::filesystem::exists(data_image)) throw std::runtime_error("No data image found");
+
+    if (!std::filesystem::exists(data_image)) {
+        std::cout << "Data image not found. creating..." << std::endl;
+        create_data_image(data_image);
+    }
 
     // parse ini
     auto ini_path = vm_dir / "vm.ini";
