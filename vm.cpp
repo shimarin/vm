@@ -207,6 +207,9 @@ struct RunOptions {
     const std::optional<bool> kvm = std::nullopt;
     const std::vector<std::tuple<std::string/*bridge*/,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
     const std::vector<std::filesystem::path>& usb = {};
+    const std::optional<std::string>& append = std::nullopt;
+    const std::optional<std::string>& display = std::nullopt;
+    const bool hvc = false;
     const bool stdio_console = false;
 };
 
@@ -252,22 +255,42 @@ int run(const std::filesystem::path& system_file, const RunOptions& options)
         waitpid(pid, NULL, 0);
     },  virtiofsd_pid);
 
+    std::string append = "root=/dev/vda ro net.ifnames=0 systemd.firstboot=0 systemd.hostname=" + vmname;
+    if (options.hvc) {
+        append += " console=hvc0";
+    } else {
+        append += " console=ttyS0,115200n8r";
+    }
+    if (options.append.has_value()) {
+        append += ' ';
+        append += options.append.value();
+    }
     std::vector<std::string> qemu_cmdline = {
         "qemu-system-x86_64", "-M","q35",
         "-m", std::to_string(options.memory),
-        "-smp", "cpus=" + std::to_string(options.cpus), 
         "-object", "memory-backend-memfd,id=mem,size=" + std::to_string(options.memory) + "M,share=on", "-numa", "node,memdev=mem",
-        "-display", "none",
-        "-device", "virtio-serial-pci", "-device", "virtconsole,chardev=hvc",
-        "-chardev", (options.stdio_console? "stdio,signal=off,id=hvc" : "socket,path=" + console_sock(vmname).string() + ",server=on,wait=off,id=hvc"), 
-        "-kernel", kernel.string(), 
-        "-append", "console=hvc0 root=/dev/vda ro net.ifnames=0 systemd.firstboot=0 systemd.hostname=" + vmname,
+        "-kernel", kernel.string(), "-append", append,
+        "-display", options.display.value_or("none"),
         "-monitor", "unix:" + monitor_sock(vmname).string() + ",server,nowait",
         "-qmp", "unix:" + qmp_sock(vmname).string() + ",server,nowait",
         "-chardev", "socket,path=" + qga_sock(vmname).string() + ",server=on,wait=off,id=qga0",
         "-device", "virtio-serial", "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
         "-drive", "file=" + system_file.string() + ",format=raw,index=0,readonly=on,media=disk,if=virtio,aio=native,cache.direct=on"
     };
+    if (options.hvc) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-device", "virtio-serial-pci", "-device", "virtconsole,chardev=hvc",
+            "-chardev", (options.stdio_console? "stdio,signal=off,id=hvc" : "socket,path=" + console_sock(vmname).string() + ",server=on,wait=off,id=hvc")
+        }); 
+    } else {
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-serial",
+            (options.stdio_console? "mon:stdio" : "unix:" + console_sock(vmname).string() + ",server=on,wait=off")
+        });
+    }
+    if (options.cpus > 1) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-smp", "cpus=" + std::to_string(options.cpus)});
+    }
     if (options.kvm.value_or(access("/dev/kvm", R_OK|W_OK) == 0)) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-cpu", "host", "-enable-kvm"});
     }
@@ -448,6 +471,9 @@ int service(const std::string& vmname, const std::filesystem::path& vm_root, std
         usb.push_back(dev);
     }
 
+    auto append = iniparser_getstring(ini.get(), ":append", NULL);
+    auto display = iniparser_getstring(ini.get(), ":display", NULL);
+
     return run(system_file, {
             .name = vmname,
             .data_file = data_file,
@@ -456,6 +482,8 @@ int service(const std::string& vmname, const std::filesystem::path& vm_root, std
             .cpus = cpus,
             .net = net,
             .usb = usb,
+            .append = append? std::make_optional(append) : std::nullopt,
+            .display = display? std::make_optional(display) : std::nullopt,
             .stdio_console = false
         } );
 }
@@ -641,6 +669,10 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--volatile-data").default_value(false).implicit_value(true);
     run_command.add_argument("-b", "--bridge").nargs(1);
     run_command.add_argument("--virtiofs-path").nargs(1);
+    run_command.add_argument("--no-kvm").default_value(false).implicit_value(true);
+    run_command.add_argument("--append").nargs(1);
+    run_command.add_argument("--display").nargs(1);
+    run_command.add_argument("--hvc").default_value(false).implicit_value(true);
     run_command.add_argument("system_file").nargs(1);//default_value(std::string("/home/shimarin/projects/whitebase/samba.squashfs"));
     program.add_subparser(run_command);
 
@@ -720,7 +752,11 @@ static int _main(int argc, char* argv[])
                 .virtiofs_path = run_command.present("--virtiofs-path"),
                 .memory = run_command.get<uint32_t>("-m"),
                 .cpus = run_command.get<uint16_t>("-c"),
+                .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                 .net = net,
+                .append = run_command.present("--append"),
+                .display = run_command.present("--display"),
+                .hvc = run_command.get<bool>("--hvc"),
                 .stdio_console = true
             } );
     }
