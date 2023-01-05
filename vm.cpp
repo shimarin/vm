@@ -137,13 +137,13 @@ std::filesystem::path create_temporary_data_file(bool format = true)
 
 std::string generate_temporary_hostname()
 {
-    char buf[4];
+    uint8_t buf[4];
     auto fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) throw std::runtime_error("open(\"/dev/urandom\") failed");
     read(fd, buf, sizeof(buf));
     close(fd);
     char hostname[32];
-    sprintf(hostname, "host-%02x%02x%02x%02x", buf[0], buf[1], buf[2], buf[3]);
+    sprintf(hostname, "host-%02x%02x%02x%02x", (int)buf[0], (int)buf[1], (int)buf[2], (int)buf[3]);
     return hostname;
 }
 
@@ -200,83 +200,49 @@ bool is_o_direct_supported(const std::filesystem::path& file)
 
 struct RunOptions {
     const std::optional<std::string>& name = std::nullopt;
-    const std::optional<std::filesystem::path>& data_file = std::nullopt;
     const std::optional<std::filesystem::path>& virtiofs_path = std::nullopt;
     const uint32_t memory = 1024;
     const uint16_t cpus = 1;
     const std::optional<bool> kvm = std::nullopt;
     const std::vector<std::tuple<std::string/*bridge*/,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
     const std::vector<std::filesystem::path>& usb = {};
+    const std::vector<std::pair<std::filesystem::path,bool/*virtio*/>>& disks = {};
+    const std::optional<std::filesystem::path>& cdrom = std::nullopt;
     const std::optional<std::string>& append = std::nullopt;
     const std::optional<std::string>& display = std::nullopt;
     const bool hvc = false;
     const bool stdio_console = false;
 };
 
-int run(const std::filesystem::path& system_file, const RunOptions& options)
+int lock_vm(const std::string& vmname)
 {
-    auto vmname = options.name.value_or(get_default_hostname(system_file).value_or(generate_temporary_hostname()));
-    std::filesystem::create_directories(vm_run_dir(vmname));
-
-    // Lock VM
     auto vm_run_dir_fd = open(vm_run_dir(vmname).c_str(), O_RDONLY, 0);
     if (vm_run_dir_fd < 0) throw std::runtime_error(std::string("open(") + vm_run_dir(vmname).string() + ") failed");
 
     if (flock(vm_run_dir_fd, LOCK_EX|LOCK_NB) < 0) {
         close(vm_run_dir_fd);
-        if (errno == EWOULDBLOCK) throw std::runtime_error(vmname + " is already running");
+        if (errno == EWOULDBLOCK) return -1;
         else throw std::runtime_error(std::string("flock(") + run_dir.string() + ") failed");
     }
-    Finally<int> vm_run_dir_lock([](auto fd){
-        flock(fd, LOCK_UN);
-        close(fd);
-    }, vm_run_dir_fd);
+    return vm_run_dir_fd;
+}
 
-    const auto [kernel, initramfs] = extract_kernel_and_initramfs(system_file);
+pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::path& path)
+{
+    auto pid = fork();
+    if (pid < 0) throw std::runtime_error("fork() failed");
+    if (pid == 0) {
+        _exit(execlp("/usr/libexec/virtiofsd", "/usr/libexec/virtiofsd", 
+            "-f", "-o", ("cache=none,flock,posix_lock,xattr,allow_direct_io,source=" + path.string()).c_str(),
+            ("--socket-path=" + virtiofs_sock(vmname).string()).c_str(),
+            NULL));
+    }
+    //else
+    return pid;
+}
 
-    pid_t virtiofsd_pid = -1;
-    if (options.virtiofs_path.has_value()) {
-        auto virtiofs_path = options.virtiofs_path.value();
-        std::cout << "Starting virtiofsd with " << virtiofs_path.string() << "..." << std::endl;
-        virtiofsd_pid = fork();
-        if (virtiofsd_pid < 0) throw std::runtime_error("fork() failed");
-        if (virtiofsd_pid == 0) {
-            _exit(execlp("/usr/libexec/virtiofsd", "/usr/libexec/virtiofsd", 
-                "-f", "-o", ("cache=none,flock,posix_lock,xattr,allow_direct_io,source=" + virtiofs_path.string()).c_str(),
-                ("--socket-path=" + virtiofs_sock(vmname).string()).c_str(),
-                NULL));
-        }
-    }
-    Finally<pid_t> virtiofsd([](auto pid) {
-        if (pid < 0) return;
-        //else
-        std::cout << "Shutting down virtiofsd..." << std::endl;
-        kill(pid, SIGTERM);
-        waitpid(pid, NULL, 0);
-    },  virtiofsd_pid);
-
-    std::string append = "root=/dev/vda ro net.ifnames=0 systemd.firstboot=0 systemd.hostname=" + vmname;
-    if (options.hvc) {
-        append += " console=hvc0";
-    } else {
-        append += " console=ttyS0,115200n8r";
-    }
-    if (options.append.has_value()) {
-        append += ' ';
-        append += options.append.value();
-    }
-    std::vector<std::string> qemu_cmdline = {
-        "qemu-system-x86_64", "-M","q35",
-        "-m", std::to_string(options.memory),
-        "-object", "memory-backend-memfd,id=mem,size=" + std::to_string(options.memory) + "M,share=on", "-numa", "node,memdev=mem",
-        "-kernel", kernel.string(), "-append", append,
-        "-display", options.display.value_or("none"),
-        "-monitor", "unix:" + monitor_sock(vmname).string() + ",server,nowait",
-        "-qmp", "unix:" + qmp_sock(vmname).string() + ",server,nowait",
-        "-chardev", "socket,path=" + qga_sock(vmname).string() + ",server=on,wait=off,id=qga0",
-        "-device", "virtio-serial", "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
-        "-drive", "file=" + system_file.string() + ",format=raw,index=0,readonly=on,media=disk,if=virtio,aio=native,cache.direct=on"
-    };
+void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector<std::string>& qemu_cmdline, const RunOptions& options)
+{
     if (options.hvc) {
         qemu_cmdline.insert(qemu_cmdline.end(), {
             "-device", "virtio-serial-pci", "-device", "virtconsole,chardev=hvc",
@@ -294,15 +260,6 @@ int run(const std::filesystem::path& system_file, const RunOptions& options)
     if (options.kvm.value_or(access("/dev/kvm", R_OK|W_OK) == 0)) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-cpu", "host", "-enable-kvm"});
     }
-    if (initramfs.has_value()) {
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-initrd", initramfs.value()});
-    }
-    if (options.data_file.has_value()) {
-        auto _ = options.data_file.value();
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + _.string() + ",format=raw,index=1,media=disk,if=virtio" 
-            + (is_o_direct_supported(_)? ",aio=native,cache.direct=on":"") });
-    }
-
     int net_num = 0;
     for (const auto& [bridge,macaddr,vhost]:options.net) {
         auto generate_macaddr_from_name = [](const std::string& vmname, int num) {
@@ -332,25 +289,39 @@ int run(const std::filesystem::path& system_file, const RunOptions& options)
         }
     }
 
-    int chardev_idx = 0;
-    if (virtiofsd_pid >= 0) {
-        auto chardev = std::string("char") + std::to_string(chardev_idx++);
+    if (options.cdrom.has_value()) {
         qemu_cmdline.insert(qemu_cmdline.end(), {
-            "-chardev", "socket,id=" + chardev + ",path=" + virtiofs_sock(vmname).string(),
-            "-device", "vhost-user-fs-pci,queue-size=1024,chardev=" + chardev + ",tag=fs"
+            "-cdrom", options.cdrom.value().string()
         });
     }
+}
 
-    std::cout << "Executing QEMU..." << std::endl;
+void append_disk_to_qemu_cmdline(std::vector<std::string>& qemu_cmdline, const std::filesystem::path& disk, bool virtio = true)
+{
+    qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + disk.string() + ",format=raw,media=disk"
+        + (virtio? ",if=virtio" : "")
+        + (is_o_direct_supported(disk)? ",aio=native,cache.direct=on":"") });
+}
+
+void apply_virtiofs_to_qemu_cmdline(const std::string& vmname, std::vector<std::string>& qemu_cmdline, pid_t virtiofsd_pid)
+{
+    qemu_cmdline.insert(qemu_cmdline.end(), {
+        "-chardev", "socket,id=virtiofs,path=" + virtiofs_sock(vmname).string(),
+        "-device", "vhost-user-fs-pci,queue-size=1024,chardev=virtiofs,tag=fs"
+    });
+}
+
+int run_qemu(const std::string& vmname, const std::vector<std::string>& cmdline, pid_t virtiofsd_pid = -1)
+{
     auto qemu_pid = fork();
     if (qemu_pid < 0) throw std::runtime_error("fork() failed");
     if (qemu_pid == 0) { // child process
-        char ** argv = new char *[qemu_cmdline.size() + 1];
-        for (int i = 0; i < qemu_cmdline.size(); i++) {
-            argv[i] = strdup(qemu_cmdline[i].c_str());
+        char ** argv = new char *[cmdline.size() + 1];
+        for (int i = 0; i < cmdline.size(); i++) {
+            argv[i] = strdup(cmdline[i].c_str());
         }
-        argv[qemu_cmdline.size()] = NULL;
-        _exit(execvp(qemu_cmdline[0].c_str(), argv));
+        argv[cmdline.size()] = NULL;
+        _exit(execvp(cmdline[0].c_str(), argv));
     }
 
     sigset_t mask;
@@ -410,6 +381,138 @@ int run(const std::filesystem::path& system_file, const RunOptions& options)
     return WEXITSTATUS(qemu_wstatus);
 }
 
+int run(const std::filesystem::path& system_file, const std::optional<std::filesystem::path>& data_file, 
+    const RunOptions& options)
+{
+    auto vmname = options.name.value_or(get_default_hostname(system_file).value_or(generate_temporary_hostname()));
+    std::filesystem::create_directories(vm_run_dir(vmname));
+
+    //lock VM
+    auto vm_lock_fd = lock_vm(vmname);
+    if (vm_lock_fd < 0) throw std::runtime_error(vmname + " is already running");
+    //else
+    Finally<int> vm_run_dir_lock([](auto fd){
+        flock(fd, LOCK_UN);
+        close(fd);
+    }, vm_lock_fd);
+
+    const auto [kernel, initramfs] = extract_kernel_and_initramfs(system_file);
+
+    std::string append = "root=/dev/vda ro net.ifnames=0 systemd.firstboot=0 systemd.hostname=" + vmname;
+    if (options.hvc) {
+        append += " console=hvc0";
+    } else {
+        append += " console=ttyS0,115200n8r";
+    }
+    if (options.append.has_value()) {
+        append += ' ';
+        append += options.append.value();
+    }
+    std::vector<std::string> qemu_cmdline = {
+        "qemu-system-x86_64", "-M","q35",
+        "-m", std::to_string(options.memory),
+        "-object", "memory-backend-memfd,id=mem,size=" + std::to_string(options.memory) + "M,share=on", "-numa", "node,memdev=mem",
+        "-kernel", kernel.string(), "-append", append,
+        "-display", options.display.value_or("none"),
+        "-monitor", "unix:" + monitor_sock(vmname).string() + ",server,nowait",
+        "-qmp", "unix:" + qmp_sock(vmname).string() + ",server,nowait",
+        "-chardev", "socket,path=" + qga_sock(vmname).string() + ",server=on,wait=off,id=qga0",
+        "-device", "virtio-serial", "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
+        "-drive", "file=" + system_file.string() + ",format=raw,index=0,readonly=on,media=disk,if=virtio,aio=native,cache.direct=on"
+    };
+
+    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options);
+
+    if (initramfs.has_value()) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-initrd", initramfs.value()});
+    }
+    if (data_file.has_value()) {
+        auto _ = data_file.value();
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + _.string() + ",format=raw,index=1,media=disk,if=virtio" 
+            + (is_o_direct_supported(_)? ",aio=native,cache.direct=on":"") });
+    }
+
+    for (const auto& [disk,virtio] : options.disks) {
+        append_disk_to_qemu_cmdline(qemu_cmdline, disk, virtio);
+    }
+
+    auto virtiofsd_pid = [&]() {
+        if (!options.virtiofs_path.has_value()) return -1;
+        //else
+        std::cout << "Starting virtiofsd with " << options.virtiofs_path.value().string() << "..." << std::endl;
+        auto pid = run_virtiofsd(vmname, options.virtiofs_path.value());
+        apply_virtiofs_to_qemu_cmdline(vmname, qemu_cmdline, pid);
+        return pid;
+    } ();
+
+    Finally<pid_t> virtiofsd([](auto pid) {
+        if (pid < 0) return;
+        //else
+        std::cout << "Shutting down virtiofsd..." << std::endl;
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+    },  virtiofsd_pid);
+
+
+    std::cout << "Executing QEMU..." << std::endl;
+    return run_qemu(vmname, qemu_cmdline, virtiofsd_pid);
+}
+
+int run_bios(const RunOptions& options)
+{
+    auto vmname = options.name.value_or(generate_temporary_hostname());
+    std::filesystem::create_directories(vm_run_dir(vmname));
+
+    //lock VM
+    auto vm_lock_fd = lock_vm(vmname);
+    if (vm_lock_fd < 0) throw std::runtime_error(vmname + " is already running");
+    //else
+    Finally<int> vm_run_dir_lock([](auto fd){
+        flock(fd, LOCK_UN);
+        close(fd);
+    }, vm_lock_fd);
+
+    std::vector<std::string> qemu_cmdline = {
+        "qemu-system-x86_64", "-M","q35",
+        "-m", std::to_string(options.memory),
+        "-object", "memory-backend-memfd,id=mem,size=" + std::to_string(options.memory) + "M,share=on", "-numa", "node,memdev=mem",
+        "-display", options.display.value_or("none"),
+        "-monitor", "unix:" + monitor_sock(vmname).string() + ",server,nowait",
+        "-qmp", "unix:" + qmp_sock(vmname).string() + ",server,nowait",
+        "-chardev", "socket,path=" + qga_sock(vmname).string() + ",server=on,wait=off,id=qga0",
+        "-device", "virtio-serial", "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0"
+    };
+
+    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options);
+    if (options.cdrom.has_value()) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-boot", "once=d"});
+    }
+
+    auto virtiofsd_pid = [&]() {
+        if (!options.virtiofs_path.has_value()) return -1;
+        //else
+        std::cout << "Starting virtiofsd with " << options.virtiofs_path.value().string() << "..." << std::endl;
+        auto pid = run_virtiofsd(vmname, options.virtiofs_path.value());
+        apply_virtiofs_to_qemu_cmdline(vmname, qemu_cmdline, pid);
+        return pid;
+    } ();
+
+    Finally<pid_t> virtiofsd([](auto pid) {
+        if (pid < 0) return;
+        //else
+        std::cout << "Shutting down virtiofsd..." << std::endl;
+        kill(pid, SIGTERM);
+        waitpid(pid, NULL, 0);
+    },  virtiofsd_pid);
+
+    for (const auto& [disk,virtio] : options.disks) {
+        append_disk_to_qemu_cmdline(qemu_cmdline, disk, virtio);
+    }
+
+    std::cout << "Executing QEMU(BIOS)..." << std::endl;
+    return run_qemu(vmname, qemu_cmdline, virtiofsd_pid);
+}
+
 int service(const std::string& vmname, const std::filesystem::path& vm_root, std::optional<const std::string> bridge)
 {
     std::cout << "VM root = " << vm_root << std::endl;
@@ -434,6 +537,8 @@ int service(const std::string& vmname, const std::filesystem::path& vm_root, std
     uint16_t cpus = iniparser_getint(ini.get(), ":cpu", 1);
     if (cpus < 1) throw std::runtime_error("Invalid cpu number");
 
+    std::string type = iniparser_getstring(ini.get(), ":type", "genpack");
+
     std::vector<std::tuple<std::string,std::optional<std::string>,bool>> net;
     for (int i = 0; i < 10; i++) {
         char buf[16];
@@ -455,37 +560,59 @@ int service(const std::string& vmname, const std::filesystem::path& vm_root, std
         net.push_back({bridge.value(), std::nullopt, true});
     }
 
-    // load USB config
+    // scan USB devices
     std::vector<std::filesystem::path> usb;
     for (int i = 0; i < 10; i++) {
-        char buf[16];
-        sprintf(buf, "usb%d", i);
-        if (iniparser_find_entry(ini.get(), buf) == 0) continue;
-        //else
-        sprintf(buf, "usb%d:device", i);
-        auto dev = iniparser_getstring(ini.get(), buf, NULL);
-        if (!dev) {
-            std::cerr << "Device path specification(like 'device=/dev/bus/usb/XXX/YYY') is missing for USB " << i << ". USB device ignored." << std::endl;
-            continue;
+        auto device = vm_dir / ("usb" + std::to_string(i));
+        if (std::filesystem::exists(device) && std::filesystem::is_character_file(device)) {
+            usb.push_back(device);
         }
-        usb.push_back(dev);
     }
 
     auto append = iniparser_getstring(ini.get(), ":append", NULL);
     auto display = iniparser_getstring(ini.get(), ":display", NULL);
 
-    return run(system_file, {
-            .name = vmname,
-            .data_file = data_file,
-            .virtiofs_path = virtiofs_path,
-            .memory = memory,
-            .cpus = cpus,
-            .net = net,
-            .usb = usb,
-            .append = append? std::make_optional(append) : std::nullopt,
-            .display = display? std::make_optional(display) : std::nullopt,
-            .stdio_console = false
-        } );
+    std::vector<std::pair<std::filesystem::path,bool>> disks;
+    for (int i = 0; i < 10; i++) {
+        auto disk_name = "disk" + std::to_string(i);
+        auto disk = vm_dir / disk_name;
+        auto virtio = iniparser_getboolean(ini.get(), "virtio", true);
+        if (std::filesystem::exists(disk)) disks.push_back({disk,virtio});
+    }
+
+    auto cdrom = 
+        std::filesystem::exists(vm_dir / "cdrom")? std::make_optional(vm_dir / "cdrom") : std::nullopt;
+
+    if (type == "genpack") {
+        return run(system_file, data_file, {
+                .name = vmname,
+                .virtiofs_path = virtiofs_path,
+                .memory = memory,
+                .cpus = cpus,
+                .net = net,
+                .usb = usb,
+                .disks = disks,
+                .cdrom = cdrom,
+                .append = append? std::make_optional(append) : std::nullopt,
+                .display = display? std::make_optional(display) : std::nullopt,
+                .stdio_console = false
+            } );
+    } else if (type == "bios") {
+        return run_bios({
+                .name = vmname,
+                .virtiofs_path = virtiofs_path,
+                .memory = memory,
+                .cpus = cpus,
+                .net = net,
+                .usb = usb,
+                .disks = disks,
+                .cdrom = cdrom,
+                .display = display? std::make_optional(display) : std::nullopt,
+                .stdio_console = false
+            } );
+    } else {
+        throw std::runtime_error("Unknown VM type '" + type + "'.");
+    }
 }
 
 int console(const std::string& vmname)
@@ -665,15 +792,18 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("-n", "--name").nargs(1);
     run_command.add_argument("-m", "--memory").default_value<uint32_t>(1024).scan<'u',uint32_t>();
     run_command.add_argument("-c", "--cpu").default_value<uint16_t>(1).scan<'u',uint16_t>().help("Number of CPU cores");
-    run_command.add_argument("-d", "--data-file").nargs(1);
+    run_command.add_argument("--bios").default_value(false).implicit_value(true);
+    run_command.add_argument("--no-virtio-for-bios-disks").default_value(false).implicit_value(true);
+    run_command.add_argument("-d", "--data-file").nargs(1).help("Data file(or D drive image in BIOS mode)");
     run_command.add_argument("--volatile-data").default_value(false).implicit_value(true);
+    run_command.add_argument("--cdrom").nargs(1);
     run_command.add_argument("-b", "--bridge").nargs(1);
     run_command.add_argument("--virtiofs-path").nargs(1);
     run_command.add_argument("--no-kvm").default_value(false).implicit_value(true);
     run_command.add_argument("--append").nargs(1);
     run_command.add_argument("--display").nargs(1);
     run_command.add_argument("--hvc").default_value(false).implicit_value(true);
-    run_command.add_argument("system_file").nargs(1);//default_value(std::string("/home/shimarin/projects/whitebase/samba.squashfs"));
+    run_command.add_argument("system_file").nargs(1).help("System file (or C drive image in BIOS mode)");
     program.add_subparser(run_command);
 
     argparse::ArgumentParser service_command("service");
@@ -724,6 +854,10 @@ static int _main(int argc, char* argv[])
         }
         return 1;
     }
+    catch (const std::invalid_argument& err) {
+        std::cerr << err.what() << std::endl;
+        return 1;
+    }
 
     if (program.is_subcommand_used("run")) {
         const auto system_file = run_command.get("system_file");
@@ -744,16 +878,37 @@ static int _main(int argc, char* argv[])
             net.push_back({bridge.value(), std::nullopt/*generate mac address automatically*/, true});
         }
 
-        return run(system_file, {
-                .name = run_command.present("-n"),
-                .data_file = (volatile_data || data_file.has_value())? 
+        auto real_data_file = (volatile_data || data_file.has_value())? 
                     std::make_optional(volatile_data? create_temporary_data_file() : std::filesystem::path(data_file.value()))
-                    : std::nullopt,
+                    : std::nullopt;
+
+        if (run_command.get<bool>("--bios")) {
+            auto virtio = !run_command.get<bool>("--no-virtio-for-bios-disks");
+            std::vector<std::pair<std::filesystem::path,bool>> disks = {{system_file, virtio}};
+            if (real_data_file.has_value()) disks.push_back({real_data_file.value(), virtio});
+            return run_bios({
+                    .name = run_command.present("-n"),
+                    .virtiofs_path = run_command.present("--virtiofs-path"),
+                    .memory = run_command.get<uint32_t>("-m"),
+                    .cpus = run_command.get<uint16_t>("-c"),
+                    .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
+                    .net = net,
+                    .disks = disks,
+                    .cdrom = run_command.present("--cdrom"),
+                    .display = run_command.present("--display"),
+                    .hvc = run_command.get<bool>("--hvc"),
+                    .stdio_console = true
+                } );
+        }
+        // else 
+        return run(system_file, real_data_file, {
+                .name = run_command.present("-n"),
                 .virtiofs_path = run_command.present("--virtiofs-path"),
                 .memory = run_command.get<uint32_t>("-m"),
                 .cpus = run_command.get<uint16_t>("-c"),
                 .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                 .net = net,
+                .cdrom = run_command.present("--cdrom"),
                 .append = run_command.present("--append"),
                 .display = run_command.present("--display"),
                 .hvc = run_command.get<bool>("--hvc"),
