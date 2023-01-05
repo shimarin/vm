@@ -172,6 +172,17 @@ int sock_connect(const std::filesystem::path& sock_path)
 
 auto qmp_connect(const std::string& vmname) {return sock_connect(qmp_sock(vmname));}
 
+bool qmp_ping(const std::string& vmname)
+{
+    auto qmp_fd = qmp_connect(vmname);
+    if (qmp_fd < 0) return false;
+    //else
+    receive_message(qmp_fd);
+    shutdown(qmp_fd, SHUT_WR);
+    close(qmp_fd);
+    return true;
+}
+
 bool qmp_shutdown(const std::string& vmname, bool force)
 {
     auto qmp_fd = qmp_connect(vmname);
@@ -336,17 +347,10 @@ int run_qemu(const std::string& vmname, const std::vector<std::string>& cmdline,
     struct pollfd pollfds[1];
     bool qemu_ready_notified = false;
     while (true) {
-        if (!qemu_ready_notified) {
-            // ping using qmp
-            auto qmp_fd = qmp_connect(vmname);
-            if (qmp_fd < 0) {
-                receive_message(qmp_fd);
-                shutdown(qmp_fd, SHUT_WR);
-                close(qmp_fd);
-                sd_notify(0, "READY=1");
-                qemu_ready_notified = true;
-                std::cout << "QEMU is running." << std::endl;
-            }
+        if (!qemu_ready_notified && qmp_ping(vmname)) {
+            sd_notify(0, "READY=1");
+            qemu_ready_notified = true;
+            std::cout << "QEMU is running." << std::endl;
         }
         pollfds[0].fd = sigfd;
         pollfds[0].events = POLLIN;
@@ -818,8 +822,14 @@ static int _main(int argc, char* argv[])
     console_command.add_argument("vmname").nargs(1);
     program.add_subparser(console_command);
 
+    argparse::ArgumentParser start_command("start");
+    start_command.add_description("Start VM using systemd");
+    start_command.add_argument("-c", "--console").default_value(false).implicit_value(true);
+    start_command.add_argument("vmname").nargs(1);
+    program.add_subparser(start_command);
+
     argparse::ArgumentParser stop_command("stop");
-    stop_command.add_description("Terminate VM");
+    stop_command.add_description("Stop VM");
     stop_command.add_argument("-c", "--console").default_value(false).implicit_value(true);
     stop_command.add_argument("-f", "--force").default_value(false).implicit_value(true);
     stop_command.add_argument("vmname").nargs(1);
@@ -843,6 +853,8 @@ static int _main(int argc, char* argv[])
             std::cerr << service_command;
         } else if (program.is_subcommand_used("console")) {
             std::cerr << console_command;
+        } else if (program.is_subcommand_used("start")) {
+            std::cerr << start_command;
         } else if (program.is_subcommand_used("stop")) {
             std::cerr << stop_command;
         } else if (program.is_subcommand_used("show")) {
@@ -922,6 +934,30 @@ static int _main(int argc, char* argv[])
 
     if (program.is_subcommand_used("console")) {
         return console(console_command.get("vmname"));
+    }
+
+    if (program.is_subcommand_used("start")) {
+        auto vmname = start_command.get("vmname");
+        if (qmp_ping(vmname)) throw std::runtime_error(vmname + " is already running");
+        auto pid = fork();
+        if (pid < 0) throw std::runtime_error("fork() failed");
+        if (pid == 0) {
+            auto service_name = ("vm@" + vmname).c_str();
+            if (is_root_user()) {
+                _exit(execlp("systemctl", "systemctl", "start", service_name, NULL));
+            } else {
+                _exit(execlp("systemctl", "systemctl", "--user", "start", service_name, NULL));
+            }
+        }
+        int wstatus;
+        waitpid(pid, &wstatus, 0);
+        if (!WIFEXITED(wstatus)) throw std::runtime_error("systemctl command terminated abnormally");
+        auto status = WEXITSTATUS(wstatus);
+        if (status == 0 && start_command.get<bool>("-c")) {
+            return console(vmname);
+        }
+        //else
+        return status;
     }
 
     if (program.is_subcommand_used("stop")) {
