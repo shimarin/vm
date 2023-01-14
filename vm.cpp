@@ -615,6 +615,9 @@ static int run(const std::filesystem::path& system_file, const std::optional<std
         append += ' ';
         append += options.append.value();
     }
+    if (options.display && *options.display != "none") {
+        append += " console=tty1";
+    }
     std::vector<std::string> qemu_cmdline = {
         "qemu-system-x86_64", "-M","q35",
         "-kernel", kernel.string(), "-append", append,
