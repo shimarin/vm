@@ -22,6 +22,9 @@
 #include <sys/un.h>
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <ext2fs/ext2_fs.h>
 
 #include <openssl/md5.h>
 #include <libsmartcols/libsmartcols.h>
@@ -1078,6 +1081,80 @@ static int list()
     return 0;
 }
 
+static int allocate(const std::filesystem::path& filename, uint32_t size)
+{
+    if (size < 1) throw std::runtime_error("Size must be larger than zero");
+    auto fd = open(filename.c_str(), O_CREAT|O_RDWR, S_IRUSR|S_IWUSR);
+    if (fd < 0) throw std::runtime_error("Creating file with open() failed. Error createing data file.");
+    int f = 0;
+    if (ioctl(fd, EXT2_IOC_GETFLAGS, &f) == 0 && !(f & FS_NOCOW_FL)) {
+        f |= FS_NOCOW_FL;
+        ioctl(fd, EXT2_IOC_SETFLAGS, &f);
+    }
+    close(fd);
+    auto size_in_gib = size * 1024LL * 1024L * 1024L;
+    if (std::filesystem::file_size(filename) > size_in_gib) throw std::runtime_error("Shrinking size is not allowed");
+    //else
+    fd = open(filename.c_str(), O_RDWR);
+    if (fd < 0) throw std::runtime_error("open() failed. Error createing data file.");
+    if (fallocate(fd, 0, 0, size_in_gib) < 0) {
+        close(fd);
+        throw std::runtime_error("fallocate() failed. Error createing data file. (err=" + std::string(strerror(errno)) + ")");
+    }
+    close(fd);
+    return 0;
+}
+
+static int expand(const std::string& vmname)
+{
+    auto qmp_sock = qmp_connect(vmname);
+    if (qmp_sock < 0) throw std::runtime_error("Unable to connect VM");
+
+    Finally<int> qmp_sock_finally([](auto fd){
+        shutdown(fd, SHUT_WR);
+        close(fd);
+    }, qmp_sock);
+
+    receive_message(qmp_sock); // drop greeting message
+    execute_query(qmp_sock, nlohmann::json({ {"execute", "qmp_capabilities"} }));
+    auto blockdevices = execute_query(qmp_sock, nlohmann::json({ {"execute", "query-block"} }));
+    if (!blockdevices || !blockdevices->contains("return")) throw std::runtime_error("Invalid response from VM");
+    for (auto& blockdevice : blockdevices.value()["return"]) {
+        if (blockdevice["removable"] != false || !blockdevice.contains("inserted")) continue;
+        auto inserted = blockdevice["inserted"];
+        if (inserted["ro"] != false || !inserted.contains("image")) continue;
+        auto image = inserted["image"];
+        if (image["format"] != "raw" || !image.contains("filename") || !image.contains("virtual-size")) continue;
+        auto device = blockdevice["device"].get<std::string>();
+        auto filename = image["filename"].get<std::filesystem::path>();
+        auto size = image["virtual-size"] .get<uint64_t>();
+        if (size < 1024L * 1024L) continue; // smaller than 1MB should be ignored
+        std::uintmax_t newsize = 0;
+        if (std::filesystem::exists(filename)) {
+            if (std::filesystem::is_regular_file(filename)) {
+                newsize = std::filesystem::file_size(filename);
+            } else if (std::filesystem::is_block_file(filename)) {
+                auto fd = open(filename.c_str(), O_RDONLY);
+                if (fd >= 0) {
+                    uint64_t blocksize;
+                    if (ioctl(fd, BLKGETSIZE64, &blocksize) == 0) {
+                        newsize = blocksize;
+                    }
+                    close(fd);
+                }
+            }
+        }
+        if (newsize < size) continue;
+        //else
+        auto rst = execute_query(qmp_sock, nlohmann::json({ {"execute", "block_resize"}, {"arguments", {{"device", device}, {"size", newsize}} } }));
+        if (!rst || !rst->contains("return")) throw std::runtime_error("Failed to resize block device " + device + "(" + filename.string() + ")");
+        //else 
+        std::cout << device << "(" << filename << ") on " << vmname << " resized from " << size << " to " << newsize << "." << std::endl;
+    }
+
+    return 0;
+}
+
 static int _main(int argc, char* argv[])
 {
     argparse::ArgumentParser program(argv[0]);
@@ -1133,6 +1210,15 @@ static int _main(int argc, char* argv[])
     argparse::ArgumentParser list_command("list");
     program.add_subparser(list_command);
 
+    argparse::ArgumentParser allocate_command("allocate");
+    allocate_command.add_argument("filename").nargs(1);
+    allocate_command.add_argument("size").nargs(1).scan<'u',uint32_t>().help("Size in GiB");
+    program.add_subparser(allocate_command);
+
+    argparse::ArgumentParser expand_command("expand");
+    expand_command.add_argument("vmname").nargs(1);
+    program.add_subparser(expand_command);
+
     try {
         program.parse_args(argc, argv);
     }
@@ -1152,6 +1238,10 @@ static int _main(int argc, char* argv[])
             std::cerr << show_command;
         } else if (program.is_subcommand_used("list")) {
             std::cerr << list_command;
+        } else if (program.is_subcommand_used("allocate")) {
+            std::cerr << allocate_command;
+        } else if (program.is_subcommand_used("expand")) {
+            std::cerr << expand_command;
         } else {
             std::cerr << program;
         }
@@ -1284,6 +1374,17 @@ static int _main(int argc, char* argv[])
 
     if (program.is_subcommand_used("list")) {
         return list();
+    }
+
+    if (program.is_subcommand_used("allocate")) {
+        auto filename = allocate_command.get("filename");
+        auto size = allocate_command.get<uint32_t>("size");
+        return allocate(filename, size);
+    }
+
+    if (program.is_subcommand_used("expand")) {
+        auto vmname = expand_command.get("vmname");
+        return expand(vmname);
     }
 
     std::cout << program;
