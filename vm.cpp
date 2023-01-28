@@ -265,6 +265,7 @@ struct RunOptions {
     const std::vector<std::tuple<std::string/*bridge*/,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
     const std::vector<std::filesystem::path>& usb = {};
     const std::vector<std::pair<std::filesystem::path,bool/*virtio*/>>& disks = {};
+    const std::vector<std::string>& pci = {};
     const std::optional<std::filesystem::path>& cdrom = std::nullopt;
     const std::optional<std::string>& append = std::nullopt;
     const std::optional<std::string>& display = std::nullopt;
@@ -290,15 +291,17 @@ static int lock_vm(const std::string& vmname)
 
 static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::path& path)
 {
+    auto sock = virtiofs_sock(vmname);
     auto pid = fork();
     if (pid < 0) throw std::runtime_error("fork() failed");
     if (pid == 0) {
         _exit(execlp("/usr/libexec/virtiofsd", "/usr/libexec/virtiofsd", 
             "-f", "-o", ("cache=none,flock,posix_lock,xattr,allow_direct_io,source=" + path.string()).c_str(),
-            ("--socket-path=" + virtiofs_sock(vmname).string()).c_str(),
+            ("--socket-path=" + sock.string()).c_str(),
             NULL));
     }
     //else
+    // TODO: wait for socket to be ready
     return pid;
 }
 
@@ -464,6 +467,11 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector
         qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + disk.string() + ",format=raw,media=disk"
             + (virtio? ",if=virtio" : "")
             + (is_o_direct_supported(disk)? ",aio=native,cache.direct=on":"") });
+    }
+    // Passthrough PCI devices
+    for (const auto& pci : options.pci) {
+        qemu_cmdline.push_back("-device");
+        qemu_cmdline.push_back("vfio-pci,host=" + pci);
     }
     // Network interfaces
     int net_num = 0;
@@ -671,7 +679,6 @@ static int run(const std::filesystem::path& system_file, const std::optional<std
         waitpid(pid, NULL, 0);
     },  virtiofsd_pid);
 
-
     std::cout << "Executing QEMU..." << std::endl;
     return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid);
 }
@@ -785,13 +792,39 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     for (int i = 0; i < 10; i++) {
         auto disk_name = "disk" + std::to_string(i);
         auto disk = vm_dir / disk_name;
-        auto virtio = iniparser_getboolean(ini.get(), "virtio", true);
+        char buf[16];
+        sprintf(buf, "disk%d:virtio", i);
+        auto virtio = iniparser_getboolean(ini.get(), buf, true);
         if (std::filesystem::exists(disk)) disks.push_back({disk,virtio});
+    }
+   
+    // PCI passthrough
+    /*
+        e.g.
+        modprobe vfio-pci
+        echo -n "0000:01:00.0" > /sys/bus/pci/drivers/amdgpu/unbind
+        echo vfio-pci > /sys/bus/pci/devices/0000\:01\:00.0/driver_override
+        echo 0000:01:00.0 > /sys/bus/pci/drivers_probe
+
+        echo -n "0000:01:00.1" > /sys/bus/pci/drivers/snd_hda_intel/unbind
+        echo vfio-pci > /sys/bus/pci/devices/0000\:01\:00.1/driver_override
+        echo 0000:01:00.1 > /sys/bus/pci/drivers_probe
+    */
+    std::vector<std::string> pci;
+    for (int i = 0; i < 10; i++) {
+        char buf[16];
+        sprintf(buf, "pci%d", i);
+        if (iniparser_find_entry(ini.get(), buf) == 0) continue;
+        sprintf(buf, "pci%d:id", i);
+        auto pci_id = iniparser_getstring(ini.get(), buf, NULL);
+        if (!pci_id) throw std::runtime_error("id is not specified for pci" + std::to_string(i));
+        //else
+        pci.push_back(pci_id);
     }
 
     auto cdrom = 
         std::filesystem::exists(vm_dir / "cdrom")? std::make_optional(vm_dir / "cdrom") : std::nullopt;
-    
+
     auto application_ini = generate_application_ini_file(ini.get());
     std::map<std::string,std::filesystem::path> firmware_files;
     if (application_ini.has_value()) {
@@ -814,6 +847,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .net = net,
                 .usb = usb,
                 .disks = disks,
+                .pci = pci,
                 .cdrom = cdrom,
                 .append = append? std::make_optional(append) : std::nullopt,
                 .display = display? std::make_optional(display) : std::nullopt,
@@ -830,6 +864,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .net = net,
                 .usb = usb,
                 .disks = disks,
+                .pci = pci,
                 .cdrom = cdrom,
                 .display = display? std::make_optional(display) : std::nullopt,
                 .stdio_console = false,
@@ -1175,6 +1210,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--append").nargs(1);
     run_command.add_argument("--display").nargs(1);
     run_command.add_argument("--hvc").default_value(false).implicit_value(true);
+    run_command.add_argument("--pci").nargs(1);
     run_command.add_argument("system_file").nargs(1).help("System file (or C drive image in BIOS mode)");
     program.add_subparser(run_command);
 
@@ -1274,6 +1310,8 @@ static int _main(int argc, char* argv[])
         auto real_data_file = (volatile_data || data_file.has_value())? 
                     std::make_optional(volatile_data? create_temporary_data_file() : std::filesystem::path(data_file.value()))
                     : std::nullopt;
+        
+        auto pci = run_command.get<std::vector<std::string>>("--pci");
 
         if (run_command.get<bool>("--bios")) {
             auto virtio = !run_command.get<bool>("--no-virtio-for-bios-disks");
@@ -1287,6 +1325,7 @@ static int _main(int argc, char* argv[])
                     .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                     .net = net,
                     .disks = disks,
+                    .pci = pci,
                     .cdrom = run_command.present("--cdrom"),
                     .display = run_command.present("--display"),
                     .hvc = run_command.get<bool>("--hvc"),
@@ -1301,6 +1340,7 @@ static int _main(int argc, char* argv[])
                 .cpus = run_command.get<uint16_t>("-c"),
                 .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                 .net = net,
+                .pci = pci,
                 .cdrom = run_command.present("--cdrom"),
                 .append = run_command.present("--append"),
                 .display = run_command.present("--display"),
