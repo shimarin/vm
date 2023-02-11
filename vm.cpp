@@ -271,6 +271,7 @@ struct RunOptions {
     const std::optional<std::string>& display = std::nullopt;
     const bool hvc = false;
     const bool stdio_console = false;
+    const bool no_shutdown = false;
     const std::map<std::string,std::string>& firmware_strings = {};
     const std::map<std::string,std::filesystem::path>& firmware_files = {};
     const std::map<std::string,std::string>& qemu_env = {};
@@ -521,6 +522,10 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector
         qemu_cmdline.insert(qemu_cmdline.end(), {
             "-fw_cfg", "opt/" + name + ",file=" + file.string()
         });
+    }
+
+    if (options.no_shutdown) {
+        qemu_cmdline.push_back("-no-shutdown");
     }
 }
 
@@ -1211,6 +1216,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--display").nargs(1);
     run_command.add_argument("--hvc").default_value(false).implicit_value(true);
     run_command.add_argument("--pci").nargs(1);
+    run_command.add_argument("--no-shutdown").default_value(false).implicit_value(true);
     run_command.add_argument("system_file").nargs(1).help("System file (or C drive image in BIOS mode)");
     program.add_subparser(run_command);
 
@@ -1329,7 +1335,8 @@ static int _main(int argc, char* argv[])
                     .cdrom = run_command.present("--cdrom"),
                     .display = run_command.present("--display"),
                     .hvc = run_command.get<bool>("--hvc"),
-                    .stdio_console = true
+                    .stdio_console = true,
+                    .no_shutdown = run_command.get<bool>("--no-shutdown")
                 } );
         }
         // else 
@@ -1345,7 +1352,8 @@ static int _main(int argc, char* argv[])
                 .append = run_command.present("--append"),
                 .display = run_command.present("--display"),
                 .hvc = run_command.get<bool>("--hvc"),
-                .stdio_console = true
+                .stdio_console = true,
+                .no_shutdown = run_command.get<bool>("--no-shutdown")
             } );
     }
 
