@@ -434,7 +434,7 @@ static void apply_common_args_to_qemu_cmdline(const std::string& vmname, std::ve
     }
 }
 
-static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector<std::string>& qemu_cmdline, const RunOptions& options)
+static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector<std::string>& qemu_cmdline, const RunOptions& options, bool bios = false)
 {
     // memory, display
     qemu_cmdline.insert(qemu_cmdline.end(), {
@@ -467,7 +467,7 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector
     for (const auto& [disk,virtio] : options.disks) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + disk.string() + ",format=raw,media=disk"
             + (virtio? ",if=virtio" : "")
-            + (is_o_direct_supported(disk)? ",aio=native,cache.direct=on":"") });
+            + (!bios && is_o_direct_supported(disk)? ",aio=native,cache.direct=on":"") });
     }
     // Passthrough PCI devices
     for (const auto& pci : options.pci) {
@@ -707,7 +707,7 @@ static int run_bios(const RunOptions& options)
     };
 
     apply_common_args_to_qemu_cmdline(vmname, qemu_cmdline);
-    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options);
+    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, true);
     if (options.cdrom.has_value()) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-boot", "once=d"});
     }
