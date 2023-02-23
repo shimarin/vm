@@ -367,7 +367,7 @@ static std::optional<std::filesystem::path> generate_ssh_public_keys(const std::
     if (std::filesystem::exists(authorized_keys) && std::filesystem::is_regular_file(authorized_keys)) {
         cat(authorized_keys, wfd);
     }
-    std::vector<std::filesystem::path> ssh_public_key_candidates = {"id_ecdsa.pub", "id_rsa.pub"};
+    std::vector<std::filesystem::path> ssh_public_key_candidates = {"id_ecdsa.pub", "id_ed25519.pub", "id_rsa.pub"};
     for (const auto& ssh_public_key_candidate:ssh_public_key_candidates) {
         auto ssh_public_key = ssh_dir / ssh_public_key_candidate;
         if (std::filesystem::exists(ssh_public_key) && std::filesystem::is_regular_file(ssh_public_key)) {
