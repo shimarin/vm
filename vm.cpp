@@ -297,7 +297,7 @@ static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::pat
     if (pid < 0) throw std::runtime_error("fork() failed");
     if (pid == 0) {
         _exit(execlp("/usr/libexec/virtiofsd", "/usr/libexec/virtiofsd", 
-            "-f", "-o", ("cache=none,flock,posix_lock,xattr,allow_direct_io,source=" + path.string()).c_str(),
+            "-f", "-o", ("cache=none,flock,posix_lock,xattr,modcaps=+sys_admin:+sys_resource:+fowner:+setfcap,allow_direct_io,source=" + path.string()).c_str(),
             ("--socket-path=" + sock.string()).c_str(),
             NULL));
     }
