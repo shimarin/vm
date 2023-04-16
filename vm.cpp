@@ -296,8 +296,10 @@ static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::pat
     auto pid = fork();
     if (pid < 0) throw std::runtime_error("fork() failed");
     if (pid == 0) {
+        // cache must be "auto" to enable mmap(MAP_SHARED)
+        // modcaps must be modified to allow virtiofs to be used as an upper layer of overlayfs
         _exit(execlp("/usr/libexec/virtiofsd", "/usr/libexec/virtiofsd", 
-            "-f", "-o", ("cache=none,flock,posix_lock,xattr,modcaps=+sys_admin:+sys_resource:+fowner:+setfcap,allow_direct_io,source=" + path.string()).c_str(),
+            "-f", "-o", ("cache=auto,flock,posix_lock,xattr,modcaps=+sys_admin:+sys_resource:+fowner:+setfcap,allow_direct_io,source=" + path.string()).c_str(),
             ("--socket-path=" + sock.string()).c_str(),
             NULL));
     }
