@@ -293,18 +293,37 @@ static int lock_vm(const std::string& vmname)
 static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::path& path)
 {
     auto sock = virtiofs_sock(vmname);
+    try {
+        std::filesystem::remove(sock);
+    }
+    catch (std::filesystem::filesystem_error&) {}
     auto pid = fork();
     if (pid < 0) throw std::runtime_error("fork() failed");
     if (pid == 0) {
         // cache must be "auto" to enable mmap(MAP_SHARED)
         // modcaps must be modified to allow virtiofs to be used as an upper layer of overlayfs
+        /*
         _exit(execlp("/usr/libexec/virtiofsd", "/usr/libexec/virtiofsd", 
             "-f", "-o", ("cache=auto,flock,posix_lock,xattr,modcaps=+sys_admin:+sys_resource:+fowner:+setfcap,allow_direct_io,source=" + path.string()).c_str(),
             ("--socket-path=" + sock.string()).c_str(),
             NULL));
+        */
+        _exit(execlp("virtiofsd", "virtiofsd", 
+            "--allow-direct-io", "--xattr", "--posix-acl", "--modcaps=+sys_admin:+sys_resource:+fowner:+setfcap",
+            "--cache", "auto", "--socket-path", sock.string().c_str(), "--shared-dir", path.string().c_str(),
+            NULL));
     }
     //else
-    // TODO: wait for socket to be ready
+    int count = 0;
+    while (!std::filesystem::is_socket(sock)) {
+        if (count == 0) std::cout << "Waiting for virtiofsd to start..." << std::endl;
+        usleep(100000);
+        if (++count > 100) {
+            kill(pid, SIGKILL);
+            throw std::runtime_error("virtiofsd failed to start");
+        }
+    }
+
     return pid;
 }
 
