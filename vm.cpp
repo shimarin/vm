@@ -277,6 +277,7 @@ struct RunOptions {
     const std::map<std::string,std::string>& qemu_env = {};
     const std::optional<uint64_t> virtiofs_rlimit_nofile = {};
     const std::optional<std::string> virtiofs_cache = {};
+    const std::optional<std::string> virtiofs_inode_file_handles = {};
 };
 
 static int lock_vm(const std::string& vmname)
@@ -294,7 +295,8 @@ static int lock_vm(const std::string& vmname)
 
 struct VirtiofsdOptions {
     const std::optional<uint64_t> rlimit_nofile = std::nullopt;
-    const std::optional<std::string> cache;
+    const std::optional<std::string> cache = std::nullopt;
+    const std::optional<std::string> inode_file_handles = std::nullopt;
 };
 
 static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::path& path, const VirtiofsdOptions& options)
@@ -314,7 +316,9 @@ static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::pat
             "--modcaps=+sys_admin:+sys_resource:+fowner:+setfcap",
             // cache must be "auto" to enable mmap(MAP_SHARED)
             "--cache", options.cache.value_or("auto"), 
-            "--socket-path", sock.string(), "--shared-dir", path.string()
+            "--socket-path", sock.string(), "--shared-dir", path.string(),
+            // "--inode-file-handles=prefer" is necessary to save number of file descriptors
+            "--inode-file-handles=" + options.inode_file_handles.value_or("prefer")
         };
         if (options.rlimit_nofile.has_value()) {
             args.push_back("--rlimit-nofile");
@@ -705,7 +709,8 @@ static int run(const std::filesystem::path& system_file, const std::optional<std
         if (!options.virtiofs_path.has_value()) return -1;
         //else
         std::cout << "Starting virtiofsd with " << options.virtiofs_path.value().string() << "..." << std::endl;
-        auto pid = run_virtiofsd(vmname, options.virtiofs_path.value(), {options.virtiofs_rlimit_nofile, options.virtiofs_cache});
+        auto pid = run_virtiofsd(vmname, options.virtiofs_path.value(), 
+            {options.virtiofs_rlimit_nofile, options.virtiofs_cache, options.virtiofs_inode_file_handles});
         apply_virtiofs_to_qemu_cmdline(vmname, qemu_cmdline, pid);
         return pid;
     } ();
@@ -750,7 +755,8 @@ static int run_bios(const RunOptions& options)
         if (!options.virtiofs_path.has_value()) return -1;
         //else
         std::cout << "Starting virtiofsd with " << options.virtiofs_path.value().string() << "..." << std::endl;
-        auto pid = run_virtiofsd(vmname, options.virtiofs_path.value(), {options.virtiofs_rlimit_nofile, options.virtiofs_cache});
+        auto pid = run_virtiofsd(vmname, options.virtiofs_path.value(), 
+            {options.virtiofs_rlimit_nofile, options.virtiofs_cache, options.virtiofs_inode_file_handles});
         apply_virtiofs_to_qemu_cmdline(vmname, qemu_cmdline, pid);
         return pid;
     } ();
@@ -880,6 +886,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     // virtiofs options
     long int rlimit_nofile = iniparser_getlongint(ini.get(), "virtiofs:rlimit-nofile", 0);
     const char* virtiofs_cache = iniparser_getstring(ini.get(), "virtiofs:cache", NULL);
+    const char* virtiofs_inode_file_handles = iniparser_getstring(ini.get(), "virtiofs:inode-file-handles", NULL);
 
     if (type == "genpack") {
         return run(system_file, data_file, swap_file, {
@@ -898,7 +905,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .firmware_files = firmware_files,
                 .qemu_env = qemu_env,
                 .virtiofs_rlimit_nofile = rlimit_nofile > 0? std::optional(rlimit_nofile) : std::nullopt,
-                .virtiofs_cache = virtiofs_cache? std::make_optional(std::string(virtiofs_cache)) : std::nullopt
+                .virtiofs_cache = virtiofs_cache? std::make_optional(std::string(virtiofs_cache)) : std::nullopt,
+                .virtiofs_inode_file_handles = virtiofs_inode_file_handles? std::make_optional(std::string(virtiofs_inode_file_handles)) : std::nullopt
             } );
     } else if (type == "bios") {
         return run_bios({
@@ -916,7 +924,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .firmware_files = firmware_files,
                 .qemu_env = qemu_env,
                 .virtiofs_rlimit_nofile = rlimit_nofile > 0? std::optional(rlimit_nofile) : std::nullopt,
-                .virtiofs_cache = virtiofs_cache? std::make_optional(std::string(virtiofs_cache)) : std::nullopt
+                .virtiofs_cache = virtiofs_cache? std::make_optional(std::string(virtiofs_cache)) : std::nullopt,
+                .virtiofs_inode_file_handles = virtiofs_inode_file_handles? std::make_optional(std::string(virtiofs_inode_file_handles)) : std::nullopt
             } );
     } else {
         throw std::runtime_error("Unknown VM type '" + type + "'.");
