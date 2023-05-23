@@ -275,6 +275,8 @@ struct RunOptions {
     const std::map<std::string,std::string>& firmware_strings = {};
     const std::map<std::string,std::filesystem::path>& firmware_files = {};
     const std::map<std::string,std::string>& qemu_env = {};
+    const std::optional<uint64_t> virtiofs_rlimit_nofile = {};
+    const std::optional<std::string> virtiofs_cache = {};
 };
 
 static int lock_vm(const std::string& vmname)
@@ -290,7 +292,12 @@ static int lock_vm(const std::string& vmname)
     return vm_run_dir_fd;
 }
 
-static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::path& path)
+struct VirtiofsdOptions {
+    const std::optional<uint64_t> rlimit_nofile = std::nullopt;
+    const std::optional<std::string> cache;
+};
+
+static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::path& path, const VirtiofsdOptions& options)
 {
     auto sock = virtiofs_sock(vmname);
     try {
@@ -300,18 +307,24 @@ static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::pat
     auto pid = fork();
     if (pid < 0) throw std::runtime_error("fork() failed");
     if (pid == 0) {
-        // cache must be "auto" to enable mmap(MAP_SHARED)
-        // modcaps must be modified to allow virtiofs to be used as an upper layer of overlayfs
-        /*
-        _exit(execlp("/usr/libexec/virtiofsd", "/usr/libexec/virtiofsd", 
-            "-f", "-o", ("cache=auto,flock,posix_lock,xattr,modcaps=+sys_admin:+sys_resource:+fowner:+setfcap,allow_direct_io,source=" + path.string()).c_str(),
-            ("--socket-path=" + sock.string()).c_str(),
-            NULL));
-        */
-        _exit(execlp("virtiofsd", "virtiofsd", 
-            "--allow-direct-io", "--xattr", "--posix-acl", "--modcaps=+sys_admin:+sys_resource:+fowner:+setfcap",
-            "--cache", "auto", "--socket-path", sock.string().c_str(), "--shared-dir", path.string().c_str(),
-            NULL));
+        std::vector<std::string> args = {
+            "virtiofsd", 
+            "--allow-direct-io", "--xattr", "--posix-acl",
+            // modcaps must be modified to allow virtiofs to be used as an upper layer of overlayfs
+            "--modcaps=+sys_admin:+sys_resource:+fowner:+setfcap",
+            // cache must be "auto" to enable mmap(MAP_SHARED)
+            "--cache", options.cache.value_or("auto"), 
+            "--socket-path", sock.string(), "--shared-dir", path.string()
+        };
+        if (options.rlimit_nofile.has_value()) {
+            args.push_back("--rlimit-nofile");
+            args.push_back(std::to_string(*options.rlimit_nofile));
+        }
+
+        std::vector<char*> c_args;
+        for (auto& arg:args) { c_args.push_back(&arg[0]); }
+        c_args.push_back(NULL);
+        _exit(execvp("virtiofsd", c_args.data()));
     }
     //else
     int count = 0;
@@ -692,7 +705,7 @@ static int run(const std::filesystem::path& system_file, const std::optional<std
         if (!options.virtiofs_path.has_value()) return -1;
         //else
         std::cout << "Starting virtiofsd with " << options.virtiofs_path.value().string() << "..." << std::endl;
-        auto pid = run_virtiofsd(vmname, options.virtiofs_path.value());
+        auto pid = run_virtiofsd(vmname, options.virtiofs_path.value(), {options.virtiofs_rlimit_nofile, options.virtiofs_cache});
         apply_virtiofs_to_qemu_cmdline(vmname, qemu_cmdline, pid);
         return pid;
     } ();
@@ -737,7 +750,7 @@ static int run_bios(const RunOptions& options)
         if (!options.virtiofs_path.has_value()) return -1;
         //else
         std::cout << "Starting virtiofsd with " << options.virtiofs_path.value().string() << "..." << std::endl;
-        auto pid = run_virtiofsd(vmname, options.virtiofs_path.value());
+        auto pid = run_virtiofsd(vmname, options.virtiofs_path.value(), {options.virtiofs_rlimit_nofile, options.virtiofs_cache});
         apply_virtiofs_to_qemu_cmdline(vmname, qemu_cmdline, pid);
         return pid;
     } ();
@@ -864,6 +877,10 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     const char* x11_display = iniparser_getstring(ini.get(), ":x11-display", NULL);
     if (x11_display) qemu_env["X11_DISPLAY"] = x11_display;
 
+    // virtiofs options
+    long int rlimit_nofile = iniparser_getlongint(ini.get(), "virtiofs:rlimit-nofile", 0);
+    const char* virtiofs_cache = iniparser_getstring(ini.get(), "virtiofs:cache", NULL);
+
     if (type == "genpack") {
         return run(system_file, data_file, swap_file, {
                 .name = vmname,
@@ -879,7 +896,9 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .display = display? std::make_optional(display) : std::nullopt,
                 .stdio_console = false,
                 .firmware_files = firmware_files,
-                .qemu_env = qemu_env
+                .qemu_env = qemu_env,
+                .virtiofs_rlimit_nofile = rlimit_nofile > 0? std::optional(rlimit_nofile) : std::nullopt,
+                .virtiofs_cache = virtiofs_cache? std::make_optional(std::string(virtiofs_cache)) : std::nullopt
             } );
     } else if (type == "bios") {
         return run_bios({
@@ -895,7 +914,9 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .display = display? std::make_optional(display) : std::nullopt,
                 .stdio_console = false,
                 .firmware_files = firmware_files,
-                .qemu_env = qemu_env
+                .qemu_env = qemu_env,
+                .virtiofs_rlimit_nofile = rlimit_nofile > 0? std::optional(rlimit_nofile) : std::nullopt,
+                .virtiofs_cache = virtiofs_cache? std::make_optional(std::string(virtiofs_cache)) : std::nullopt
             } );
     } else {
         throw std::runtime_error("Unknown VM type '" + type + "'.");
