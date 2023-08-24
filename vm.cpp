@@ -773,6 +773,16 @@ static int run_bios(const RunOptions& options)
     return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid);
 }
 
+static std::string escape_comma_for_qemu(const std::string& str)
+{
+    std::string ret;
+    for (auto c:str) {
+        if (c == ',') ret += ",,";
+        else ret += c;
+    }
+    return ret;
+}
+
 static int service(const std::string& vmname, const std::filesystem::path& vm_dir, std::optional<const std::string> bridge)
 {
     if (vmname == "") throw std::runtime_error("VM name must not be empty.");
@@ -869,6 +879,20 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
 
     auto cdrom = 
         std::filesystem::exists(vm_dir / "cdrom")? std::make_optional(vm_dir / "cdrom") : std::nullopt;
+    
+    std::map<std::string,std::string> firmware_strings;
+    auto firmware_keys_len = iniparser_getsecnkeys(ini.get(), "firmware-string");
+    if (firmware_keys_len > 0) {
+        const char** firmware_keys = (const char**)malloc(sizeof(const char*) * firmware_keys_len);
+        if (iniparser_getseckeys(ini.get(), "firmware-string", firmware_keys) != NULL) {
+            for (int i = 0; i < firmware_keys_len; i++) {
+                const char* key = firmware_keys[i];
+                std::string value = iniparser_getstring(ini.get(), key, "");
+                firmware_strings[key + 16/*firmware-string:*/] = escape_comma_for_qemu(value);
+            }
+        }
+        free(firmware_keys);
+    }
 
     auto application_ini = generate_application_ini_file(ini.get());
     std::map<std::string,std::filesystem::path> firmware_files;
@@ -902,6 +926,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .append = append? std::make_optional(append) : std::nullopt,
                 .display = display? std::make_optional(display) : std::nullopt,
                 .stdio_console = false,
+                .firmware_strings = firmware_strings,
                 .firmware_files = firmware_files,
                 .qemu_env = qemu_env,
                 .virtiofs_rlimit_nofile = rlimit_nofile > 0? std::optional(rlimit_nofile) : std::nullopt,
@@ -921,6 +946,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .cdrom = cdrom,
                 .display = display? std::make_optional(display) : std::nullopt,
                 .stdio_console = false,
+                .firmware_strings = firmware_strings,
                 .firmware_files = firmware_files,
                 .qemu_env = qemu_env,
                 .virtiofs_rlimit_nofile = rlimit_nofile > 0? std::optional(rlimit_nofile) : std::nullopt,
