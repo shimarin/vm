@@ -328,7 +328,7 @@ static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::pat
         std::vector<char*> c_args;
         for (auto& arg:args) { c_args.push_back(&arg[0]); }
         c_args.push_back(NULL);
-        _exit(execvp("virtiofsd", c_args.data()));
+        _exit(execvp("/usr/libexec/virtiofsd", c_args.data()));
     }
     //else
     int count = 0;
