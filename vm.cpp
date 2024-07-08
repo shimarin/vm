@@ -25,8 +25,9 @@
 #include <sys/ioctl.h>
 #include <linux/fs.h>
 #include <ext2fs/ext2_fs.h>
+#include <linux/cryptouser.h>
+#include <linux/if_alg.h>
 
-#include <openssl/md5.h>
 #include <libsmartcols/libsmartcols.h>
 #include <systemd/sd-daemon.h>
 #include <argparse/argparse.hpp>
@@ -44,6 +45,38 @@ public:
     Finally(std::function<void(const T&)> _func, const T& _arg) : func(_func), arg(_arg) {}
     ~Finally() { func(arg); }
 };
+
+static void MD5(const uint8_t* data, size_t length, uint8_t result[16])
+{
+    struct sockaddr_alg sa = {
+        .salg_family = AF_ALG,
+        .salg_type = "hash",
+        .salg_name = "md5"
+    };
+    
+    int tfmfd = socket(AF_ALG, SOCK_SEQPACKET, 0);
+    if (tfmfd == -1) throw std::runtime_error("MD5: socket() failed");
+    //else
+    Finally<int> tfmfd_cleanup([](auto fd){
+        close(fd);
+    }, tfmfd);
+
+    if (bind(tfmfd, (struct sockaddr *)&sa, sizeof(sa)) == -1) 
+        throw std::runtime_error("MD5: bind() failed");
+
+    int opfd = accept(tfmfd, NULL, 0);
+    if (opfd == -1) throw std::runtime_error("MD5: accept() failed");
+    //else
+    Finally<int> opfd_cleanup([](auto fd){
+        close(fd);
+    }, opfd);
+
+    if (write(opfd, data, length) == -1) 
+        throw std::runtime_error("MD5: write() failed");
+
+    if (read(opfd, result, 16) == -1) 
+        throw std::runtime_error("MD5: read() failed");
+}
 
 static bool is_root_user()
 {
@@ -474,6 +507,16 @@ static void apply_common_args_to_qemu_cmdline(const std::string& vmname, std::ve
 
 static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector<std::string>& qemu_cmdline, const RunOptions& options, bool bios = false)
 {
+    // machine
+    auto machine_type = bios? "q35" : "pc"; // if booting kernel directly, q35 is overkill
+    auto machine_accel = options.kvm.value_or(access("/dev/kvm", R_OK|W_OK) == 0)? "kvm" : "tcg";
+    auto machine_str = std::string("type=") + machine_type + ",accel=" + machine_accel;
+    qemu_cmdline.insert(qemu_cmdline.end(), {"-machine", machine_str});
+    if (machine_accel == "kvm") {
+        qemu_cmdline.push_back("-cpu");
+        qemu_cmdline.push_back("host");
+    }
+
     // memory, display
     qemu_cmdline.insert(qemu_cmdline.end(), {
         "-m", std::to_string(options.memory),
@@ -497,10 +540,6 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector
     if (options.cpus > 1) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-smp", "cpus=" + std::to_string(options.cpus)});
     }
-    // Whether to use KVM
-    if (options.kvm.value_or(access("/dev/kvm", R_OK|W_OK) == 0)) {
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-cpu", "host", "-enable-kvm"});
-    }
     // Disks
     for (const auto& [disk,virtio] : options.disks) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + disk.string() + ",format=raw,media=disk"
@@ -518,7 +557,7 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector
         auto generate_macaddr_from_name = [](const std::string& vmname, int num) {
             std::string name = vmname + ":" + std::to_string(num);
             unsigned char buf[16];
-            MD5((const unsigned char*)name.c_str(), name.length(), buf);
+            MD5((const uint8_t*)name.c_str(), name.length(), buf);
             uint8_t mac[6] = { 0x52, 0x54, 0x00, 0x00, 0x00, 0x00 };
             mac[3] = buf[0] & 0x7f;
             mac[4] = buf[1];
@@ -673,7 +712,7 @@ static int run(const std::filesystem::path& system_file, const std::optional<std
         append += " console=tty1";
     }
     std::vector<std::string> qemu_cmdline = {
-        "qemu-system-x86_64", "-M","q35",
+        "qemu-system-x86_64",
         "-kernel", kernel.string(), "-append", append,
         "-drive", "file=" + system_file.string() + ",format=raw,readonly=on,media=disk,if=virtio,aio=native,cache.direct=on"
     };
@@ -742,7 +781,7 @@ static int run_bios(const RunOptions& options)
     }, vm_lock_fd);
 
     std::vector<std::string> qemu_cmdline = {
-        "qemu-system-x86_64", "-M","q35"
+        "qemu-system-x86_64"
     };
 
     apply_common_args_to_qemu_cmdline(vmname, qemu_cmdline);
