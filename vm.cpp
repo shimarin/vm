@@ -342,8 +342,14 @@ static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::pat
     auto pid = fork();
     if (pid < 0) throw std::runtime_error("fork() failed");
     if (pid == 0) {
-        std::vector<std::string> args = {
-            "virtiofsd", 
+        std::vector<std::string> args;
+        if (!is_root_user()) {
+            args.insert(args.end(), {
+                "/usr/bin/podman", "unshare"
+            });
+        }
+        args.insert(args.end(), {
+            "/usr/libexec/virtiofsd", 
             "--allow-direct-io", "--xattr", "--posix-acl",
             // modcaps must be modified to allow virtiofs to be used as an upper layer of overlayfs
             "--modcaps=+sys_admin:+sys_resource:+fowner:+setfcap",
@@ -352,7 +358,7 @@ static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::pat
             "--socket-path", sock.string(), "--shared-dir", path.string(),
             // "--inode-file-handles=prefer" is necessary to save number of file descriptors
             "--inode-file-handles=" + options.inode_file_handles.value_or("prefer")
-        };
+        });
         if (options.rlimit_nofile.has_value()) {
             args.push_back("--rlimit-nofile");
             args.push_back(std::to_string(*options.rlimit_nofile));
@@ -361,7 +367,7 @@ static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::pat
         std::vector<char*> c_args;
         for (auto& arg:args) { c_args.push_back(&arg[0]); }
         c_args.push_back(NULL);
-        _exit(execvp("/usr/libexec/virtiofsd", c_args.data()));
+        _exit(execvp(c_args[0], c_args.data()));
     }
     //else
     int count = 0;
@@ -836,8 +842,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     auto swap_file = std::make_optional(vm_dir / "swapfile");
     if (!std::filesystem::exists(swap_file.value())) swap_file = std::nullopt;
 
-    auto virtiofs_path = is_root_user()? std::make_optional(vm_dir / "fs") : std::nullopt;
-    if (virtiofs_path.has_value()) std::filesystem::create_directories(virtiofs_path.value());
+    auto virtiofs_path = vm_dir / "fs";
+    std::filesystem::create_directories(virtiofs_path);
 
     auto ini_path = vm_dir / "vm.ini";
     auto ini = std::shared_ptr<dictionary>(std::filesystem::exists(ini_path)? iniparser_load(ini_path.c_str()) : dictionary_new(0), iniparser_freedict);
@@ -1418,9 +1424,6 @@ static int _main(int argc, char* argv[])
             throw std::runtime_error("--volatile-data and --data-file(-d) are exclusive.");
         }
         auto virtiofs_path = run_command.present("--virtiofs-path");
-#ifndef __VSCODE_ACTIVE_FILE__
-        if (virtiofs_path.has_value() && !is_root_user()) throw std::runtime_error("You must be root user to use virtiofs.");
-#endif
         if (!std::filesystem::exists(system_file)) throw std::runtime_error(system_file + " does not exist.");
 
         std::vector<std::tuple<std::string,std::optional<std::string>,bool>> net;
