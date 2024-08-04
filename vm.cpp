@@ -23,6 +23,7 @@
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
+#include <sys/utsname.h>
 #include <linux/fs.h>
 #include <ext2fs/ext2_fs.h>
 #include <linux/cryptouser.h>
@@ -98,7 +99,7 @@ static std::filesystem::path get_proc_fd_path(int fd)
     return proc_fd / std::to_string(fd);
 }
 
-static std::pair<std::filesystem::path,std::optional<std::filesystem::path>> 
+static std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,std::optional<std::string>> 
     extract_kernel_and_initramfs(const std::filesystem::path& system_file)
 {
     auto kernel_fd = memfd_create("kernel", 0);
@@ -131,9 +132,24 @@ static std::pair<std::filesystem::path,std::optional<std::filesystem::path>>
 
     std::filesystem::path my_proc_fd = std::filesystem::path("/proc") / std::to_string(getpid()) / "fd";
 
+    // determine kernel's CPU architecture
+    // rewind kernel fd
+    if (lseek(kernel_fd, 0, SEEK_SET) == (off_t)-1) throw std::runtime_error("lseek() failed");
+    // read kernel's magic number
+    uint8_t buf[518];
+    auto size = read(kernel_fd, buf, sizeof(buf));
+    if (size < 0) throw std::runtime_error("read() failed");
+    std::optional<std::string> arch;
+    if (buf[514] == 'H' && buf[515] == 'd' && buf[516] == 'r' && buf[517] == 'S') {
+        arch = "x86_64";
+    } else if (buf[0x38] == 0x41 && buf[0x39] == 0x52 && buf[0x3a] == 0x4d && buf[0x3b] == 0x64) {
+        arch = "aarch64";
+    }    
+
     return {
         get_proc_fd_path(kernel_fd),
-        initramfs_fd >= 0? std::optional(get_proc_fd_path(initramfs_fd)) : std::nullopt
+        initramfs_fd >= 0? std::optional(get_proc_fd_path(initramfs_fd)) : std::nullopt,
+        arch
     };
 }
 
@@ -511,17 +527,31 @@ static void apply_common_args_to_qemu_cmdline(const std::string& vmname, std::ve
     }
 }
 
-static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector<std::string>& qemu_cmdline, const RunOptions& options, bool bios = false)
+static bool is_emulation_needed(const std::string& arch)
+{
+    // get the host's architecture
+    struct utsname uts;
+    if (uname(&uts) < 0) throw std::runtime_error("uname() failed");
+    //else
+    return (arch != uts.machine);
+}
+
+static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector<std::string>& qemu_cmdline, const RunOptions& options, const std::string& arch, bool bios = false)
 {
     // machine
-    auto machine_type = bios? "q35" : "pc"; // if booting kernel directly, q35 is overkill
-    auto machine_accel = options.kvm.value_or(access("/dev/kvm", R_OK|W_OK) == 0)? "kvm" : "tcg";
+    auto machine_type = [&arch,bios]() {
+        if (arch == "x86_64") return bios? "q35" : "pc";
+        //else 
+        if (bios) throw std::runtime_error("BIOS is only supported on x86_64");
+        //else
+        return "virt";
+    }();
+    bool kvm = options.kvm.value_or(access("/dev/kvm", R_OK|W_OK) == 0) && !is_emulation_needed(arch);
+    auto machine_accel = kvm? "kvm" : "tcg";
     auto machine_str = std::string("type=") + machine_type + ",accel=" + machine_accel;
     qemu_cmdline.insert(qemu_cmdline.end(), {"-machine", machine_str});
-    if (machine_accel == "kvm") {
-        qemu_cmdline.push_back("-cpu");
-        qemu_cmdline.push_back("host");
-    }
+    qemu_cmdline.push_back("-cpu");
+    qemu_cmdline.push_back(kvm? "host" : "max");
 
     // memory, display
     qemu_cmdline.insert(qemu_cmdline.end(), {
@@ -702,13 +732,20 @@ static int run(const std::filesystem::path& system_file, const std::optional<std
         close(fd);
     }, vm_lock_fd);
 
-    const auto [kernel, initramfs] = extract_kernel_and_initramfs(system_file);
+    const auto [kernel, initramfs, arch] = extract_kernel_and_initramfs(system_file);
+    //std::cout << "Architecture: " << arch.value_or("Unknown") << std::endl;
+
+    if (!arch.has_value()) throw std::runtime_error("Unsupported kernel format");
 
     std::string append = "root=/dev/vda ro net.ifnames=0 systemd.firstboot=0 systemd.hostname=" + vmname;
     if (options.hvc) {
         append += " console=hvc0";
     } else {
-        append += " console=ttyS0,115200n8r";
+        if (arch == "aarch64" || arch->starts_with("arm")) {
+            append += " console=ttyAMA0";
+        } else {
+            append += " console=ttyS0,115200n8r";
+        }
     }
     if (options.append.has_value()) {
         append += ' ';
@@ -718,7 +755,7 @@ static int run(const std::filesystem::path& system_file, const std::optional<std
         append += " console=tty1";
     }
     std::vector<std::string> qemu_cmdline = {
-        "qemu-system-x86_64",
+        "qemu-system-" + arch.value(),
         "-kernel", kernel.string(), "-append", append,
         "-drive", "file=" + system_file.string() + ",format=raw,readonly=on,media=disk,if=virtio,aio=native,cache.direct=on"
     };
@@ -748,7 +785,7 @@ static int run(const std::filesystem::path& system_file, const std::optional<std
         qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("swapfile").string() + ",format=raw,readonly=on,media=disk,if=virtio"});
     }
 
-    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options);
+    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, arch.value());
 
     auto virtiofsd_pid = [&]() {
         if (!options.virtiofs_path.has_value()) return -1;
@@ -791,7 +828,7 @@ static int run_bios(const RunOptions& options)
     };
 
     apply_common_args_to_qemu_cmdline(vmname, qemu_cmdline);
-    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, true);
+    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, "x86_64", true);
     if (options.cdrom.has_value()) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-boot", "once=d"});
     }
