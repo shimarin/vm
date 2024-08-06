@@ -882,8 +882,6 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
     } else {
         if (arch == "aarch64" || arch->starts_with("arm")) {
             append += " console=ttyAMA0";
-        } else if (arch->starts_with("riscv")) {
-            append += " console=ttySIF0";
         } else {
             append += " console=ttyS0,115200n8r";
         }
