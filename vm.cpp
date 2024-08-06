@@ -99,38 +99,171 @@ static std::filesystem::path get_proc_fd_path(int fd)
     return proc_fd / std::to_string(fd);
 }
 
+static std::tuple<std::filesystem::path,std::optional<std::filesystem::path>> find_kernel_and_initramfs(const std::filesystem::path& fs_dir)
+{
+    std::optional<std::filesystem::path> kernel = std::nullopt;
+    std::optional<std::filesystem::path> initramfs = std::nullopt;
+    auto boot_dir = fs_dir / "boot";
+    if (std::filesystem::is_regular_file(boot_dir / "kernel")) kernel = boot_dir / "kernel";
+    else if (std::filesystem::is_regular_file(boot_dir / "vmlinuz")) kernel = boot_dir / "vmlinuz";
+
+    if (kernel) {
+        if (std::filesystem::is_regular_file(boot_dir / "initramfs")) initramfs = boot_dir / "initramfs";
+        else if (std::filesystem::is_regular_file(boot_dir / "initramfs.img")) initramfs = boot_dir / "initramfs.img";
+        else if (std::filesystem::is_regular_file(boot_dir / "initrd.img")) initramfs = boot_dir / "initrd.img";
+        return {kernel.value(), initramfs};
+    }
+    //else
+
+    // find "kernel-*" and "vmlinuz-*" under boot_dir and the latest one
+    std::filesystem::file_time_type timestamp = std::filesystem::file_time_type::min();
+    for (const auto& entry : std::filesystem::directory_iterator(boot_dir)) {
+        if (!entry.is_regular_file()) continue;
+        auto name_string = entry.path().filename().string();
+        if (!name_string.starts_with("kernel-") && !name_string.starts_with("vmlinuz-")) continue;
+        auto entry_timestamp = std::filesystem::last_write_time(entry);
+        if (entry_timestamp > timestamp) {
+            kernel = entry.path();
+            timestamp = entry_timestamp;
+        }
+    }
+    if (!kernel) throw std::runtime_error("kernel not found");
+    //else
+    auto pos = kernel->filename().string().find("-");
+    if (pos == std::string::npos) throw std::runtime_error("invalid kernel name");
+    //else
+    auto suffix = kernel->filename().string().substr(pos);
+    if (std::filesystem::is_regular_file(boot_dir / ("initramfs" + suffix))) initramfs = boot_dir / ("initramfs" + suffix);
+    else if (std::filesystem::is_regular_file(boot_dir / ("initramfs" + suffix + ".img"))) initramfs = boot_dir / ("initramfs" + suffix + ".img");
+    else if (std::filesystem::is_regular_file(boot_dir / ("initrd.img" + suffix))) initramfs = boot_dir / ("initrd.img" + suffix);
+
+    return {*kernel, initramfs};
+}
+
 static std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,std::optional<std::string>> 
-    extract_kernel_and_initramfs(const std::filesystem::path& system_file)
+    extract_kernel_and_initramfs(const std::filesystem::path& system_file_or_fs_dir)
 {
     auto kernel_fd = memfd_create("kernel", 0);
     auto initramfs_fd = memfd_create("initramfs", 0);
-    auto kernel_pid = fork();
-    if (kernel_pid < 0) throw std::runtime_error("fork() failed");
-    //else
-    if (kernel_pid == 0) {
-        close(STDOUT_FILENO);
-        dup2(kernel_fd, STDOUT_FILENO);
-        _exit(execlp("unsquashfs", "unsquashfs", "-q", "-cat", system_file.c_str(), "boot/kernel", NULL));
-    }
-    auto initramfs_pid = fork();
-    if (initramfs_pid < 0) throw std::runtime_error("fork() failed");
-    //else
-    if (initramfs_pid == 0) {
-        close(STDOUT_FILENO);
-        dup2(initramfs_fd, STDOUT_FILENO);
-        _exit(execlp("unsquashfs", "unsquashfs", "-q", "-cat", system_file.c_str(), "boot/initramfs", NULL));
-    }
-    int kernel_wstatus, initramfs_wstatus;
-    waitpid(kernel_pid, &kernel_wstatus, 0);
-    waitpid(initramfs_pid, &initramfs_wstatus, 0);
-    if (!WIFEXITED(kernel_wstatus) || WEXITSTATUS(kernel_wstatus) != 0) 
-        throw std::runtime_error("kernel extraction failed");
-    if (!WIFEXITED(initramfs_wstatus) || WEXITSTATUS(initramfs_wstatus) != 0) {
+
+    if (std::filesystem::is_regular_file(system_file_or_fs_dir)) {
+        // extract kernel and initramfs from squashfs
+        auto kernel_pid = fork();
+        if (kernel_pid < 0) {
+            close(kernel_fd);
+            close(initramfs_fd);
+            throw std::runtime_error("fork() failed");
+        }
+        //else
+        if (kernel_pid == 0) {
+            close(STDOUT_FILENO);
+            dup2(kernel_fd, STDOUT_FILENO);
+            _exit(execlp("unsquashfs", "unsquashfs", "-q", "-cat", system_file_or_fs_dir.c_str(), "boot/kernel", NULL));
+        }
+        auto initramfs_pid = fork();
+        if (initramfs_pid < 0) {
+            close(kernel_fd);
+            close(initramfs_fd);
+            throw std::runtime_error("fork() failed");
+        }
+        //else
+        if (initramfs_pid == 0) {
+            close(STDOUT_FILENO);
+            dup2(initramfs_fd, STDOUT_FILENO);
+            _exit(execlp("unsquashfs", "unsquashfs", "-q", "-cat", system_file_or_fs_dir.c_str(), "boot/initramfs", NULL));
+        }
+        int kernel_wstatus, initramfs_wstatus;
+        waitpid(kernel_pid, &kernel_wstatus, 0);
+        waitpid(initramfs_pid, &initramfs_wstatus, 0);
+        if (!WIFEXITED(kernel_wstatus) || WEXITSTATUS(kernel_wstatus) != 0)  {
+            close(kernel_fd);
+            close(initramfs_fd);
+            throw std::runtime_error("kernel extraction failed");
+        }
+        if (!WIFEXITED(initramfs_wstatus) || WEXITSTATUS(initramfs_wstatus) != 0) {
+            close(initramfs_fd);
+            initramfs_fd = -1;
+        }
+    } else if (std::filesystem::is_directory(system_file_or_fs_dir)) {
+        // copy kernel and initramfs from fs directory
+        auto [kernel, initramfs] = find_kernel_and_initramfs(system_file_or_fs_dir);
+        if (!initramfs) {
+            close(initramfs_fd);
+            initramfs_fd = -1;
+        }
+        // copy kernel to kernel_fd
+        int fd = open(kernel.c_str(), O_RDONLY);
+        if (fd < 0) {
+            close(kernel_fd);
+            if (initramfs_fd >= 0) close(initramfs_fd);
+            throw std::runtime_error("open() failed");
+        }
+        //else
+        uint8_t buf[1024];
+        ssize_t r;
+        while ((r = read(fd, buf, sizeof(buf))) > 0) {
+            write(kernel_fd, buf, r);
+        }
+        close(fd);
+        if (initramfs) {
+            // copy initramfs to initramfs_fd
+            fd = open(initramfs->c_str(), O_RDONLY);
+            if (fd < 0) {
+                close(kernel_fd);
+                close(initramfs_fd);
+                throw std::runtime_error("open() failed");
+            }
+            //else
+            while ((r = read(fd, buf, sizeof(buf))) > 0) {
+                write(initramfs_fd, buf, r);
+            }
+            close(fd);
+        }   
+    } else {
+        close(kernel_fd);
         close(initramfs_fd);
-        initramfs_fd = -1;
+        throw std::runtime_error("system file or fs directory not found");
     }
 
-    std::filesystem::path my_proc_fd = std::filesystem::path("/proc") / std::to_string(getpid()) / "fd";
+    // rewind kernel fd and check if it's gzipped
+    if (lseek(kernel_fd, 0, SEEK_SET) == (off_t)-1) {
+        close(kernel_fd);
+        if (initramfs_fd >= 0) close(initramfs_fd);
+        throw std::runtime_error("lseek() failed");
+    }
+    uint8_t magic[2];
+    if (read(kernel_fd, magic, sizeof(magic)) < 0) {
+        close(kernel_fd);
+        if (initramfs_fd >= 0) close(initramfs_fd);
+        throw std::runtime_error("read() failed");
+    }
+
+    if (magic[0] == 0x1f && magic[1] == 0x8b) {
+        // kernel is gzipped
+        auto kernel_unzipped_fd = memfd_create("kernel_unzipped", 0);
+        auto gzip_pid = fork();
+        if (gzip_pid < 0) {
+            close(kernel_fd);
+            if (initramfs_fd >= 0) close(initramfs_fd);
+            throw std::runtime_error("fork() failed");
+        }
+        //else
+        if (gzip_pid == 0) {
+            close(STDOUT_FILENO);
+            dup2(kernel_unzipped_fd, STDOUT_FILENO);
+            _exit(execlp("gunzip", "gunzip", "-c", get_proc_fd_path(kernel_fd).c_str(), NULL));
+        }
+        int gzip_wstatus;
+        waitpid(gzip_pid, &gzip_wstatus, 0);
+        if (!WIFEXITED(gzip_wstatus) || WEXITSTATUS(gzip_wstatus) != 0) {
+            close(kernel_fd);
+            if (initramfs_fd >= 0) close(initramfs_fd);
+            throw std::runtime_error("gunzip failed");
+        }
+        //else
+        close(kernel_fd);
+        kernel_fd = kernel_unzipped_fd;
+    }
 
     // determine kernel's CPU architecture
     // rewind kernel fd
@@ -144,7 +277,9 @@ static std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,std
         arch = "x86_64";
     } else if (buf[0x38] == 0x41 && buf[0x39] == 0x52 && buf[0x3a] == 0x4d && buf[0x3b] == 0x64) {
         arch = "aarch64";
-    }    
+    } else if (buf[0x30] == 'R' && buf[0x31] == 'I' && buf[0x32] == 'S' && buf[0x33] == 'C' && buf[0x34] == 'V') {
+        arch = "riscv64";
+    }
 
     return {
         get_proc_fd_path(kernel_fd),
@@ -717,10 +852,13 @@ static int run_qemu(const std::string& vmname, const std::vector<std::string>& c
     return WEXITSTATUS(qemu_wstatus);
 }
 
-static int run(const std::filesystem::path& system_file, const std::optional<std::filesystem::path>& data_file, 
+static int run(const std::optional<std::filesystem::path>& system_file, const std::optional<std::filesystem::path>& data_file, 
     const std::optional<std::filesystem::path>& swap_file, const RunOptions& options)
 {
-    auto vmname = options.name.value_or(get_default_hostname(system_file).value_or(generate_temporary_hostname()));
+    // virtiofs_path is required if system_file is not provided
+    if (!system_file && !options.virtiofs_path) throw std::runtime_error("virtiofs_path is required if system_file is not provided");
+
+    auto vmname = options.name.value_or((system_file? get_default_hostname(*system_file) : std::nullopt).value_or(generate_temporary_hostname()));
     std::filesystem::create_directories(vm_run_dir(vmname));
 
     //lock VM
@@ -732,17 +870,20 @@ static int run(const std::filesystem::path& system_file, const std::optional<std
         close(fd);
     }, vm_lock_fd);
 
-    const auto [kernel, initramfs, arch] = extract_kernel_and_initramfs(system_file);
+    const auto [kernel, initramfs, arch] = extract_kernel_and_initramfs(system_file? *system_file : options.virtiofs_path.value());
     //std::cout << "Architecture: " << arch.value_or("Unknown") << std::endl;
 
     if (!arch.has_value()) throw std::runtime_error("Unsupported kernel format");
 
-    std::string append = "root=/dev/vda ro net.ifnames=0 systemd.firstboot=0 systemd.hostname=" + vmname;
+    std::string append = system_file? "root=/dev/vda ro" : "root=fs rootfstype=virtiofs rw"; // TODO: check fstab to determine ro/rw
+    append += " net.ifnames=0 systemd.firstboot=0 systemd.hostname=" + vmname;
     if (options.hvc) {
         append += " console=hvc0";
     } else {
         if (arch == "aarch64" || arch->starts_with("arm")) {
             append += " console=ttyAMA0";
+        } else if (arch->starts_with("riscv")) {
+            append += " console=ttySIF0";
         } else {
             append += " console=ttyS0,115200n8r";
         }
@@ -756,10 +897,8 @@ static int run(const std::filesystem::path& system_file, const std::optional<std
     }
     std::vector<std::string> qemu_cmdline = {
         "qemu-system-" + arch.value(),
-        "-kernel", kernel.string(), "-append", append,
-        "-drive", "file=" + system_file.string() + ",format=raw,readonly=on,media=disk,if=virtio,aio=native,cache.direct=on"
+        "-kernel", kernel.string(), "-append", append
     };
-
 
     if (initramfs.has_value()) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-initrd", initramfs.value()});
@@ -767,19 +906,25 @@ static int run(const std::filesystem::path& system_file, const std::optional<std
 
     apply_common_args_to_qemu_cmdline(vmname, qemu_cmdline);
 
-    if (data_file.has_value()) {
-        auto _ = data_file.value();
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + _.string() + ",format=raw,media=disk,if=virtio" 
-            + (is_o_direct_supported(_)? ",aio=native,cache.direct=on":"") });
+    if (system_file) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + system_file->string() + ",format=raw,media=disk,if=virtio" 
+            + (is_o_direct_supported(*system_file)? ",aio=native,cache.direct=on":"") });
+    } else {
+        // dummy data
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("system").string() + ",format=raw,readonly=on,media=disk,if=virtio"});
+    }
+
+    if (data_file) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + data_file->string() + ",format=raw,media=disk,if=virtio" 
+            + (is_o_direct_supported(*data_file)? ",aio=native,cache.direct=on":"") });
     } else {
         // dummy data
         qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("data").string() + ",format=raw,readonly=on,media=disk,if=virtio"});
     }
 
-    if (swap_file.has_value()) {
-        auto _ = swap_file.value();
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + _.string() + ",format=raw,media=disk,if=virtio" 
-            + (is_o_direct_supported(_)? ",aio=native,cache.direct=on":"") });
+    if (swap_file) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + swap_file->string() + ",format=raw,media=disk,if=virtio" 
+            + (is_o_direct_supported(*swap_file)? ",aio=native,cache.direct=on":"") });
     } else {
         // dummy swap
         qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("swapfile").string() + ",format=raw,readonly=on,media=disk,if=virtio"});
@@ -873,7 +1018,10 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
 
     std::cout << "Starting " << vmname << " on " << vm_dir.string() << " ..." << std::endl;
 
-    auto system_file = vm_dir / "system";
+    auto system_file = [&vm_dir]() {
+        auto system_file_name = vm_dir / "system";
+        return std::filesystem::exists(system_file_name)? std::make_optional(system_file_name) : std::nullopt;
+    }();
     auto data_file = std::make_optional(vm_dir / "data");
     if (!std::filesystem::exists(data_file.value())) data_file = std::nullopt;
     auto swap_file = std::make_optional(vm_dir / "swapfile");
