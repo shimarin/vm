@@ -784,6 +784,7 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector
         "-object", "memory-backend-memfd,id=mem,size=" + std::to_string(options.memory) + "M,share=on", "-numa", "node,memdev=mem",
         "-display", options.display.value_or("none")
     });
+    if (options.display) qemu_cmdline.insert(qemu_cmdline.end(), {"-vga", "virtio"});
 
     // Console (Legacy serial, or HVC)
     if (options.hvc) {
