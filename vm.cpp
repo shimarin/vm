@@ -33,6 +33,9 @@
 #include <systemd/sd-daemon.h>
 #include <argparse/argparse.hpp>
 #include <iniparser4/iniparser.h>
+extern "C" {
+#include <squashfuse/squashfuse.h>
+}
 
 #include "json_messaging.h"
 
@@ -140,6 +143,111 @@ static std::tuple<std::filesystem::path,std::optional<std::filesystem::path>> fi
     return {*kernel, initramfs};
 }
 
+static void write_squashfs_entry_to_fd(sqfs& squashfs, sqfs_inode& dir_inode, const std::string& name, int outfd)
+{
+    sqfs_dir_entry entry;
+    sqfs_name _name;
+    sqfs_dentry_init(&entry, _name);
+    //strcpy(_name, name.c_str());
+    bool found;
+    auto err = sqfs_dir_lookup(&squashfs, &dir_inode, name.c_str(), name.length(), &entry, &found);
+    if (err != SQFS_OK) throw std::runtime_error("Failed to lookup directory entry: " + name);
+    if (!found) throw std::runtime_error("Directory entry not found: " + name);
+    sqfs_inode entry_inode;
+    sqfs_inode_get(&squashfs, &entry_inode, entry.inode);
+    //auto mtime = entry_inode.base.mtime;
+
+    off_t bytes_already_read = 0;
+    sqfs_off_t bytes_at_a_time = 64*1024;
+    while (bytes_already_read < entry_inode.xtra.reg.file_size) {
+        char buf[bytes_at_a_time];
+        if (sqfs_read_range(&squashfs, &entry_inode, (sqfs_off_t) bytes_already_read, &bytes_at_a_time, buf) != SQFS_OK) {
+            throw std::runtime_error("Failed to read range");
+        }
+        //else
+        if (write(outfd, buf, bytes_at_a_time) < 0) throw std::runtime_error("Failed to write to file");
+        bytes_already_read = bytes_already_read + bytes_at_a_time;
+    }
+}
+
+static void extract_kernel_and_initramfs(sqfs& system_file, int& kernel_fd, int& initramfs_fd)
+{
+    sqfs_inode boot_inode;
+    sqfs_inode_get(&system_file, &boot_inode, sqfs_inode_root(&system_file));
+    bool found;
+    sqfs_err err = sqfs_lookup_path(&system_file, &boot_inode, "boot", &found);
+    if (err != SQFS_OK) throw std::runtime_error("Failed to lookup path: boot");
+    if (!found) throw std::runtime_error("Path not found: boot");
+    //else
+    sqfs_dir boot_dir;
+    if (sqfs_dir_open(&system_file, &boot_inode, &boot_dir, 0) != SQFS_OK) {
+        throw std::runtime_error("Failed to open directory: boot");
+    }
+    //else
+    sqfs_dir_entry entry;
+    sqfs_name name;
+    sqfs_dentry_init(&entry, name);
+    std::map<std::string,std::pair<time_t,std::optional<std::string>>> entries;
+    while (true) {
+        bool has_next = sqfs_dir_next(&system_file, &boot_dir, &entry, &err);
+        if (err != SQFS_OK) throw std::runtime_error("Failed to read directory entry");
+        //else
+        if (!has_next) break;
+        //else
+        sqfs_inode entry_inode;
+        sqfs_inode_get(&system_file, &entry_inode, entry.inode);
+        auto mtime = entry_inode.base.mtime;
+        std::string entry_name(entry.name, entry.name_size);
+        if (entry.type == SQUASHFS_REG_TYPE) {
+            entries[entry_name] = {mtime, std::nullopt};
+        } else if (entry.type == SQUASHFS_SYMLINK_TYPE) {
+            char buf[SQUASHFS_NAME_LEN + 1];
+            auto size = sizeof(buf);
+            err = sqfs_readlink(&system_file, &entry_inode, buf, &size);
+            if (err != SQFS_OK) throw std::runtime_error("Failed to read symlink: " + std::string(entry_name));
+            //else
+            entries[entry_name] = {mtime, buf};
+        }
+    }
+
+    std::optional<std::string> kernel, initramfs;
+    if (entries.find("vmlinuz") != entries.end()) kernel = "vmlinuz";
+    else if (entries.find("kernel") != entries.end()) kernel = "kernel";
+    if (kernel) {
+        if (entries.find("initramfs") != entries.end()) initramfs = "initramfs";
+        else if (entries.find("initramfs.img") != entries.end()) initramfs = "initramfs.img";
+        else if (entries.find("initrd.img") != entries.end()) initramfs = "initrd.img";
+    } else {
+        time_t latest = 0;
+        for (const auto& [name, mtime_and_target] : entries) {
+            if (name.starts_with("vmlinuz-") || name.starts_with("kernel-")) {
+                if (mtime_and_target.first > latest) {
+                    kernel = name;
+                    latest = mtime_and_target.first;
+                }
+            }
+        }
+        if (!kernel) throw std::runtime_error("No kernel found");
+        //else
+        auto pos = kernel->find("-");
+        if (pos == std::string::npos) throw std::runtime_error("invalid kernel name:" + *kernel);
+        //else
+        auto suffix = kernel->substr(pos);
+        if (entries.find("initramfs" + suffix) != entries.end()) initramfs = "initramfs" + suffix;
+        else if (entries.find("initramfs" + suffix + ".img") != entries.end()) initramfs = "initramfs" + suffix + ".img";
+        else if (entries.find("initrd.img" + suffix ) != entries.end()) initramfs = "initrd.img" + suffix;
+    }
+    if (!initramfs) {
+        close(initramfs_fd);
+        initramfs_fd = -1;
+    }
+    //else
+    write_squashfs_entry_to_fd(system_file, boot_inode, entries.at(*kernel).second.value_or(*kernel), kernel_fd);
+    if (initramfs && initramfs_fd >= 0) {
+        write_squashfs_entry_to_fd(system_file, boot_inode, entries.at(*initramfs).second.value_or(*initramfs), initramfs_fd);
+    } 
+}
+
 static std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,std::optional<std::string>> 
     extract_kernel_and_initramfs(const std::filesystem::path& system_file_or_fs_dir)
 {
@@ -147,43 +255,24 @@ static std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,std
     auto initramfs_fd = memfd_create("initramfs", 0);
 
     if (std::filesystem::is_regular_file(system_file_or_fs_dir)) {
-        // extract kernel and initramfs from squashfs
-        auto kernel_pid = fork();
-        if (kernel_pid < 0) {
+        sqfs fs;
+        if (sqfs_open_image(&fs, system_file_or_fs_dir.c_str(), 0) != SQFS_OK) {
             close(kernel_fd);
             close(initramfs_fd);
-            throw std::runtime_error("fork() failed");
+            throw std::runtime_error("Failed to open squashfs image");
         }
         //else
-        if (kernel_pid == 0) {
-            close(STDOUT_FILENO);
-            dup2(kernel_fd, STDOUT_FILENO);
-            _exit(execlp("unsquashfs", "unsquashfs", "-q", "-cat", system_file_or_fs_dir.c_str(), "boot/kernel", NULL));
+        try {
+            extract_kernel_and_initramfs(fs, kernel_fd, initramfs_fd);
         }
-        auto initramfs_pid = fork();
-        if (initramfs_pid < 0) {
+        catch (std::exception&) {
             close(kernel_fd);
             close(initramfs_fd);
-            throw std::runtime_error("fork() failed");
-        }
-        //else
-        if (initramfs_pid == 0) {
-            close(STDOUT_FILENO);
-            dup2(initramfs_fd, STDOUT_FILENO);
-            _exit(execlp("unsquashfs", "unsquashfs", "-q", "-cat", system_file_or_fs_dir.c_str(), "boot/initramfs", NULL));
-        }
-        int kernel_wstatus, initramfs_wstatus;
-        waitpid(kernel_pid, &kernel_wstatus, 0);
-        waitpid(initramfs_pid, &initramfs_wstatus, 0);
-        if (!WIFEXITED(kernel_wstatus) || WEXITSTATUS(kernel_wstatus) != 0)  {
-            close(kernel_fd);
-            close(initramfs_fd);
-            throw std::runtime_error("kernel extraction failed");
-        }
-        if (!WIFEXITED(initramfs_wstatus) || WEXITSTATUS(initramfs_wstatus) != 0) {
-            close(initramfs_fd);
-            initramfs_fd = -1;
-        }
+            sqfs_fd_close(fs.fd);
+            throw;
+        }        
+
+        sqfs_fd_close(fs.fd);
     } else if (std::filesystem::is_directory(system_file_or_fs_dir)) {
         // copy kernel and initramfs from fs directory
         auto [kernel, initramfs] = find_kernel_and_initramfs(system_file_or_fs_dir);
