@@ -726,6 +726,7 @@ static std::optional<std::filesystem::path> generate_application_ini_file(const 
 static void apply_common_args_to_qemu_cmdline(const std::string& vmname, std::vector<std::string>& qemu_cmdline)
 {
     qemu_cmdline.insert(qemu_cmdline.end(), {
+        "-nodefaults", "-device", "usb-ehci", "-device", "usb-kbd", "-device", "usb-tablet", "-rtc", "base=utc",
         "-monitor", "unix:" + monitor_sock(vmname).string() + ",server,nowait",
         "-qmp", "unix:" + qmp_sock(vmname).string() + ",server,nowait",
         "-chardev", "socket,path=" + qga_sock(vmname).string() + ",server=on,wait=off,id=qga0",
