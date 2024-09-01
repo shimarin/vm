@@ -6,6 +6,7 @@
 #include <cassert>
 #include <future>
 #include <set>
+#include <format>
 
 #include <string.h>
 #include <unistd.h>
@@ -535,7 +536,7 @@ struct RunOptions {
     const uint32_t memory = default_memory_size;
     const uint16_t cpus = 1;
     const std::optional<bool> kvm = std::nullopt;
-    const std::vector<std::tuple<std::string/*bridge*/,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
+    const std::vector<std::tuple<std::string/*bridge*/,std::optional<std::string>/*mac address*/,bool/*vhost*/,std::optional<std::string>>/*tap*/>& net = {};
     const std::vector<std::filesystem::path>& usb = {};
     const std::vector<std::pair<std::filesystem::path,bool/*virtio*/>>& disks = {};
     const std::vector<std::string>& pci = {};
@@ -815,7 +816,7 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector
     }
     // Network interfaces
     int net_num = 0;
-    for (const auto& [bridge,macaddr,vhost]:options.net) {
+    for (const auto& [bridge,macaddr,vhost,tap]:options.net) {
         auto generate_macaddr_from_name = [](const std::string& vmname, int num) {
             std::string name = vmname + ":" + std::to_string(num);
             unsigned char buf[16];
@@ -828,10 +829,29 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector
             sprintf(mac_str, "%02x:%02x:%02x:%02x:%02x:%02x", (int)mac[0], (int)mac[1], (int)mac[2], (int)mac[3], (int)mac[4], (int)mac[5]);
             return std::string(mac_str);
         };
+        const auto net_id = "net" + std::to_string(net_num);
+        const auto _macaddr = macaddr.value_or(generate_macaddr_from_name(vmname, net_num));
+        const auto netdev = [&net_id,&bridge,&vhost,&tap]() {
+            if (tap) {
+                return std::format("tap,id={},br={},ifname={},script=no,downscript=no{}", net_id, bridge, *tap, vhost? ",vhost=on" : "");
+            } else {
+                return std::format("tap,id={},br={},helper=/usr/libexec/qemu-bridge-helper{}", net_id, bridge, vhost? ",vhost=on" : "");
+            }
+        }();
+        const auto device = std::format("virtio-net-pci,romfile=,netdev={},mac={}", net_id, _macaddr);
+        // TODO: apply tap
         qemu_cmdline.insert(qemu_cmdline.end(), {
-            "-netdev", "tap,id=net" + std::to_string(net_num) + ",br=" + bridge + ",helper=/usr/libexec/qemu-bridge-helper" + (vhost? ",vhost=on" : ""), 
-            "-device", "virtio-net-pci,romfile=,netdev=net" + std::to_string(net_num) + ",mac=" + macaddr.value_or(generate_macaddr_from_name(vmname, net_num))});
+            "-netdev", netdev, 
+            "-device", device
+        });
         net_num++;
+    }
+    if (net_num == 0) {
+        // default host only network
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-netdev", "user,id=net0",
+            "-device", "virtio-net-pci,romfile=,netdev=net0"
+        });
     }
     // USB devices
     if (options.usb.size() > 0) {
@@ -1129,25 +1149,26 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
 
     std::string type = iniparser_getstring(ini.get(), ":type", "genpack");
 
-    std::vector<std::tuple<std::string,std::optional<std::string>,bool>> net;
+    std::vector<std::tuple<std::string,std::optional<std::string>,bool,std::optional<std::string>>> net;
     for (int i = 0; i < 10; i++) {
-        char buf[16];
-        sprintf(buf, "net%d", i);
-        if (iniparser_find_entry(ini.get(), buf) == 0) continue;
-        sprintf(buf, "net%d:bridge", i);
-        auto bridge_str = iniparser_getstring(ini.get(), buf, NULL);
-        sprintf(buf, "net%d:mac", i);
-        auto mac = iniparser_getstring(ini.get(), buf, NULL);
-        sprintf(buf, "net%d:vhost", i);
-        bool vhost = (bool)iniparser_getboolean(ini.get(), buf, 1);
+        if (iniparser_find_entry(ini.get(), std::format("net{}", i).c_str()) == 0) continue;
+        auto bridge_str = iniparser_getstring(ini.get(), std::format("net{}:bridge", i).c_str(), NULL);
+        auto mac = iniparser_getstring(ini.get(), std::format("net{}:mac", i).c_str(), NULL);
+        bool vhost = (bool)iniparser_getboolean(ini.get(), std::format("net{}:vhost", i).c_str(), 1);
+        auto tap = iniparser_getstring(ini.get(), std::format("net{}:tap", i).c_str(), NULL);
 
         if ((i > 0 || !bridge.has_value()) && !bridge_str) throw std::runtime_error("Bridge for net" + std::to_string(i) + " must be specified.");
         if (!bridge_str) bridge_str = bridge.value().c_str();
-        net.push_back({bridge_str, mac? std::make_optional(std::string(mac)) : std::nullopt, vhost});
+        net.push_back({
+            bridge_str, 
+            mac? std::make_optional(std::string(mac)) : std::nullopt, 
+            vhost, 
+            tap? std::make_optional(std::string(tap)) : std::nullopt
+        });
     }
 
     if (net.size() == 0 && bridge.has_value()) { // if no net section and default bridge given, add default netif
-        net.push_back({bridge.value(), std::nullopt, true});
+        net.push_back({bridge.value(), std::nullopt, true, std::nullopt});
     }
 
     // scan USB devices
@@ -1606,6 +1627,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--volatile-data").default_value(false).implicit_value(true);
     run_command.add_argument("--cdrom").nargs(1);
     run_command.add_argument("-b", "--bridge").nargs(1);
+    run_command.add_argument("-t", "--tap").nargs(1);
     run_command.add_argument("--virtiofs-path").nargs(1);
     run_command.add_argument("--no-kvm").default_value(false).implicit_value(true);
     run_command.add_argument("--append").nargs(1);
@@ -1700,10 +1722,11 @@ static int _main(int argc, char* argv[])
         auto virtiofs_path = run_command.present("--virtiofs-path");
         if (!std::filesystem::exists(system_file)) throw std::runtime_error(system_file + " does not exist.");
 
-        std::vector<std::tuple<std::string,std::optional<std::string>,bool>> net;
+        std::vector<std::tuple<std::string,std::optional<std::string>,bool,std::optional<std::string>>> net;
         auto bridge = run_command.present("-b");
         if (bridge.has_value()) {
-            net.push_back({bridge.value(), std::nullopt/*generate mac address automatically*/, true});
+            auto tap = run_command.present("-t");
+            net.push_back({bridge.value(), std::nullopt/*generate mac address automatically*/, true, tap});
         }
 
         auto real_data_file = (volatile_data || data_file.has_value())? 
