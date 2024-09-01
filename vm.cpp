@@ -1173,7 +1173,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
             });
         } else if (tap) {
             net.push_back({
-                Tap(bridge_str), 
+                Tap(tap), 
                 mac? std::make_optional(std::string(mac)) : std::nullopt, 
                 vhost
             });
