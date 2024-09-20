@@ -328,7 +328,7 @@ static std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,std
         throw std::runtime_error("read() failed");
     }
 
-    if (magic[0] == 0x1f && magic[1] == 0x8b) {
+    if (magic[0] == 0x1f && magic[1] == 0x8b) { // simply gzip'ed kernel
         // kernel is gzipped
         auto kernel_unzipped_fd = memfd_create("kernel_unzipped", 0);
         auto gzip_pid = fork();
@@ -353,6 +353,61 @@ static std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,std
         //else
         close(kernel_fd);
         kernel_fd = kernel_unzipped_fd;
+    }
+
+    if (magic[0] == 'M' && magic[1] == 'Z') { // PE image
+        // check if kernel is self-extracting(EFI_ZBOOT) image
+        uint8_t zimg_header[26];
+        if (read(kernel_fd, zimg_header, sizeof(zimg_header)) < 0) {
+            close(kernel_fd);
+            if (initramfs_fd >= 0) close(initramfs_fd);
+            throw std::runtime_error("read() failed");
+        }
+        if (memcmp(zimg_header, "\0\0zimg", 5) == 0 && memcmp(zimg_header + 22, "gzip", 4) == 0) {
+            // kernel is self-extracting image
+            // find gzip header from trailing
+            // gzip_offset = kernel_bin.find(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
+            uint8_t buffer_to_find_gzip_header_from_the_rest[65536];
+            if (read(kernel_fd, buffer_to_find_gzip_header_from_the_rest, sizeof(buffer_to_find_gzip_header_from_the_rest)) < 0) {
+                close(kernel_fd);
+                if (initramfs_fd >= 0) close(initramfs_fd);
+                throw std::runtime_error("read() failed");
+            }
+            auto gzip_offset = std::string_view(reinterpret_cast<char*>(buffer_to_find_gzip_header_from_the_rest), sizeof(buffer_to_find_gzip_header_from_the_rest)).find("\x1f\x8b\x08\x00\x00\x00\x00\x00");
+            if (gzip_offset == std::string_view::npos) {
+                close(kernel_fd);
+                if (initramfs_fd >= 0) close(initramfs_fd);
+                throw std::runtime_error("gzip header not found");
+            }
+            //else(gzip header found)
+            // rewind kernel_fd to 2 + 26 + gzip_offset
+            if (lseek(kernel_fd, 2 + 26 + gzip_offset, SEEK_SET) == (off_t)-1) {
+                close(kernel_fd);
+                if (initramfs_fd >= 0) close(initramfs_fd);
+                throw std::runtime_error("lseek() failed");
+            }
+            auto kernel_unzipped_fd = memfd_create("kernel_unzipped", 0);
+            auto gzip_pid = fork();
+            if (gzip_pid < 0) {
+                close(kernel_fd);
+                if (initramfs_fd >= 0) close(initramfs_fd);
+                throw std::runtime_error("fork() failed");
+            }
+            //else
+            if (gzip_pid == 0) {
+                close(STDOUT_FILENO);
+                dup2(kernel_unzipped_fd, STDOUT_FILENO);
+                close(STDIN_FILENO);
+                dup2(kernel_fd, STDIN_FILENO);
+                _exit(execlp("gunzip", "gunzip", "-c", NULL));
+            }
+            int gzip_wstatus;
+            waitpid(gzip_pid, &gzip_wstatus, 0);
+            // in this case, gzip may return non-zero exit status because it's not a regular gzip file.
+            // so we don't check exit status here.
+            close(kernel_fd);
+            kernel_fd = kernel_unzipped_fd;
+        }
     }
 
     // determine kernel's CPU architecture
