@@ -366,14 +366,14 @@ static std::tuple<std::filesystem::path,std::optional<std::filesystem::path>,std
         if (memcmp(zimg_header, "\0\0zimg", 5) == 0 && memcmp(zimg_header + 22, "gzip", 4) == 0) {
             // kernel is self-extracting image
             // find gzip header from trailing
-            // gzip_offset = kernel_bin.find(b"\x1f\x8b\x08\x00\x00\x00\x00\x00")
             uint8_t buffer_to_find_gzip_header_from_the_rest[65536];
             if (read(kernel_fd, buffer_to_find_gzip_header_from_the_rest, sizeof(buffer_to_find_gzip_header_from_the_rest)) < 0) {
                 close(kernel_fd);
                 if (initramfs_fd >= 0) close(initramfs_fd);
                 throw std::runtime_error("read() failed");
             }
-            auto gzip_offset = std::string_view(reinterpret_cast<char*>(buffer_to_find_gzip_header_from_the_rest), sizeof(buffer_to_find_gzip_header_from_the_rest)).find("\x1f\x8b\x08\x00\x00\x00\x00\x00");
+            std::string_view gzip_haader("\x1f\x8b\x08\x00\x00\x00\x00\x00", 8);
+            auto gzip_offset = std::string_view(reinterpret_cast<char*>(buffer_to_find_gzip_header_from_the_rest), sizeof(buffer_to_find_gzip_header_from_the_rest)).find(gzip_haader);
             if (gzip_offset == std::string_view::npos) {
                 close(kernel_fd);
                 if (initramfs_fd >= 0) close(initramfs_fd);
