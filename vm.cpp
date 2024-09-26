@@ -1076,11 +1076,11 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
     apply_common_args_to_qemu_cmdline(vmname, qemu_cmdline);
 
     if (system_file) {
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + system_file->string() + ",format=raw,media=disk,if=virtio" 
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + system_file->string() + ",format=raw,media=disk,if=virtio,readonly=on" 
             + (is_o_direct_supported(*system_file)? ",aio=native,cache.direct=on":"") });
     } else {
         // dummy data
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("system").string() + ",format=raw,readonly=on,media=disk,if=virtio"});
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("system").string() + ",format=raw,readonly=on,media=disk,if=virtio,readonly=on"});
     }
 
     if (data_file) {
@@ -1088,7 +1088,7 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
             + (is_o_direct_supported(*data_file)? ",aio=native,cache.direct=on":"") });
     } else {
         // dummy data
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("data").string() + ",format=raw,readonly=on,media=disk,if=virtio"});
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("data").string() + ",format=raw,readonly=on,media=disk,if=virtio,readonly=on"});
     }
 
     if (swap_file) {
@@ -1096,7 +1096,7 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
             + (is_o_direct_supported(*swap_file)? ",aio=native,cache.direct=on":"") });
     } else {
         // dummy swap
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("swapfile").string() + ",format=raw,readonly=on,media=disk,if=virtio"});
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("swapfile").string() + ",format=raw,readonly=on,media=disk,if=virtio,readonly=on"});
     }
 
     apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, arch.value());
