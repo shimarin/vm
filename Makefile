@@ -3,7 +3,7 @@ PREFIX ?= /usr/local
 all: vm.bin mirrortap.bin vm.so
 
 vm.bin: vm.cpp json_messaging.cpp
-	g++ -std=c++20 -D__USE_REAL_MAIN__ -o $@ $^ -liniparser4 -lsystemd -lsmartcols -lsquashfuse
+	g++ -std=c++20 -D__USE_REAL_MAIN__ -o $@ $^ -liniparser -lsystemd -lsmartcols -lsquashfuse
 
 vm.so: vm.cpp json_messaging.cpp
 	g++ -std=c++20 -g -shared -fPIC -o $@ $^

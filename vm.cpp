@@ -33,7 +33,7 @@
 #include <libsmartcols/libsmartcols.h>
 #include <systemd/sd-daemon.h>
 #include <argparse/argparse.hpp>
-#include <iniparser4/iniparser.h>
+#include <iniparser/iniparser.h>
 extern "C" {
 #include <squashfuse/squashfuse.h>
 }
