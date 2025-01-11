@@ -594,6 +594,7 @@ struct RunOptions {
     const uint16_t cpus = 1;
     const std::optional<bool> kvm = std::nullopt;
     const std::vector<std::tuple<std::variant<Bridge,Tap>/*bridge or tap*/,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
+    const std::vector<std::string> hostfwd = {};
     const std::vector<std::filesystem::path>& usb = {};
     const std::vector<std::pair<std::filesystem::path,bool/*virtio*/>>& disks = {};
     const std::vector<std::string>& pci = {};
@@ -819,7 +820,8 @@ static bool is_emulation_needed(const std::string& arch)
     return (arch != uts.machine);
 }
 
-static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector<std::string>& qemu_cmdline, const RunOptions& options, const std::string& arch, bool bios = false)
+static void apply_options_to_qemu_cmdline(const std::string& vmname, 
+    std::vector<std::string>& qemu_cmdline, const RunOptions& options, const std::string& arch, bool bios = false)
 {
     // machine
     auto machine_type = [&arch,bios]() {
@@ -908,8 +910,12 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname, std::vector
     }
     if (net_num == 0) {
         // default host only network
+        std::string hostfwd_str;
+        for (const auto& hostfwd:options.hostfwd) {
+            hostfwd_str += ",hostfwd=" + hostfwd;
+        }
         qemu_cmdline.insert(qemu_cmdline.end(), {
-            "-netdev", "user,id=net0",
+            "-netdev", "user,id=net0" + hostfwd_str,
             "-device", "virtio-net-pci,romfile=,netdev=net0"
         });
     }
@@ -1696,6 +1702,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--cdrom").nargs(1);
     run_command.add_argument("-b", "--bridge").nargs(1);
     run_command.add_argument("-t", "--tap").nargs(1);
+    run_command.add_argument("--hostfwd").help("pass hostfwd to QEMU").append();
     run_command.add_argument("--virtiofs-path").nargs(1);
     run_command.add_argument("--no-kvm").default_value(false).implicit_value(true);
     run_command.add_argument("--append").nargs(1);
@@ -1799,6 +1806,8 @@ static int _main(int argc, char* argv[])
             net.push_back({Tap(*tap), std::nullopt/*generate mac address automatically*/, true});
         }
 
+        auto hostfwd = run_command.get<std::vector<std::string>>("--hostfwd");
+
         auto real_data_file = (volatile_data || data_file.has_value())? 
                     std::make_optional(volatile_data? create_temporary_data_file() : std::filesystem::path(data_file.value()))
                     : std::nullopt;
@@ -1816,6 +1825,7 @@ static int _main(int argc, char* argv[])
                     .cpus = run_command.get<uint16_t>("-c"),
                     .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                     .net = net,
+                    .hostfwd = hostfwd,
                     .disks = disks,
                     .pci = pci,
                     .cdrom = run_command.present("--cdrom"),
@@ -1833,6 +1843,7 @@ static int _main(int argc, char* argv[])
                 .cpus = run_command.get<uint16_t>("-c"),
                 .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                 .net = net,
+                .hostfwd = hostfwd,
                 .pci = pci,
                 .cdrom = run_command.present("--cdrom"),
                 .append = run_command.present("--append"),
