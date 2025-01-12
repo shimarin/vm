@@ -6,7 +6,7 @@
 #include <cassert>
 #include <future>
 #include <set>
-#include <format>
+//#include <format>
 
 #include <string.h>
 #include <unistd.h>
@@ -893,14 +893,18 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
         const auto netdev = [&net_id,&bridge_or_tap,&vhost]() {
             if (std::holds_alternative<Bridge>(bridge_or_tap)) {
                 std::string bridge = std::get<Bridge>(bridge_or_tap);
-                return std::format("tap,id={},br={},helper=/usr/libexec/qemu-bridge-helper{}", net_id, bridge, vhost? ",vhost=on" : "");
+                //return std::format("tap,id={},br={},helper=/usr/libexec/qemu-bridge-helper{}", net_id, bridge, vhost? ",vhost=on" : "");
+                //suspend using std::format as gcc12 doesn't support it
+                return "tap,id=" + net_id + ",br=" + bridge + ",helper=/usr/libexec/qemu-bridge-helper" + (vhost? ",vhost=on" : "");
             } else if (std::holds_alternative<Tap>(bridge_or_tap)) {
                 std::string tap = std::get<Tap>(bridge_or_tap);
-                return std::format("tap,id={},ifname={},script=no,downscript=no{}", net_id, tap, vhost? ",vhost=on" : "");
+                //return std::format("tap,id={},ifname={},script=no,downscript=no{}", net_id, tap, vhost? ",vhost=on" : "");
+                return "tap,id=" + net_id + ",ifname=" + tap + ",script=no,downscript=no" + (vhost? ",vhost=on" : "");
             }
             throw std::runtime_error("Invalid network type");
         }();
-        const auto device = std::format("virtio-net-pci,romfile=,netdev={},mac={}", net_id, _macaddr);
+        //const auto device = std::format("virtio-net-pci,romfile=,netdev={},mac={}", net_id, _macaddr);
+        const auto device = "virtio-net-pci,romfile=,netdev=" + net_id + ",mac=" + _macaddr;
         // TODO: apply tap
         qemu_cmdline.insert(qemu_cmdline.end(), {
             "-netdev", netdev, 
@@ -1217,11 +1221,12 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
 
     std::vector<std::tuple<std::variant<Bridge,Tap>,std::optional<std::string>,bool>> net;
     for (int i = 0; i < 10; i++) {
-        if (iniparser_find_entry(ini.get(), std::format("net{}", i).c_str()) == 0) continue;
-        auto bridge_str = iniparser_getstring(ini.get(), std::format("net{}:bridge", i).c_str(), NULL);
-        auto tap = iniparser_getstring(ini.get(), std::format("net{}:tap", i).c_str(), NULL);
-        auto mac = iniparser_getstring(ini.get(), std::format("net{}:mac", i).c_str(), NULL);
-        bool vhost = (bool)iniparser_getboolean(ini.get(), std::format("net{}:vhost", i).c_str(), 1);
+        auto section = "net" + std::to_string(i);
+        if (iniparser_find_entry(ini.get(), section.c_str()) == 0) continue; // no corresponding section
+        auto bridge_str = iniparser_getstring(ini.get(), (section + ":bridge").c_str(), NULL);
+        auto tap = iniparser_getstring(ini.get(), (section + ":tap").c_str(), NULL);
+        auto mac = iniparser_getstring(ini.get(), (section + ":mac").c_str(), NULL);
+        bool vhost = (bool)iniparser_getboolean(ini.get(), (section + ":vhost").c_str(), 1);
 
         if ((i > 0 || !bridge) && (!bridge_str && !tap)) throw std::runtime_error("Bridge or tap for net" + std::to_string(i) + " must be specified.");
         if (!bridge_str && !tap) bridge_str = bridge.value().c_str();
