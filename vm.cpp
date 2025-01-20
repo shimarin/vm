@@ -39,6 +39,7 @@ extern "C" {
 }
 
 #include "json_messaging.h"
+#include "netif.h"
 
 static const uint32_t default_memory_size = 2048;
 
@@ -584,8 +585,6 @@ static bool is_o_direct_supported(const std::filesystem::path& file)
     close(r);
     return true;
 }
-struct Bridge : public std::string {};
-struct Tap : public std::string {};
 
 struct RunOptions {
     const std::optional<std::string>& name = std::nullopt;
@@ -593,9 +592,9 @@ struct RunOptions {
     const uint32_t memory = default_memory_size;
     const uint16_t cpus = 1;
     const std::optional<bool> kvm = std::nullopt;
-    const std::vector<std::tuple<std::variant<Bridge,Tap>/*bridge or tap*/,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
+    const std::vector<std::tuple<netif::type::Some,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
     const std::vector<std::string> hostfwd = {};
-    const std::vector<std::string> netdev_mcast = {};
+    //const std::vector<std::string> netdev_mcast = {};
     const std::vector<std::filesystem::path>& usb = {};
     const std::vector<std::pair<std::filesystem::path,bool/*virtio*/>>& disks = {};
     const std::vector<std::string>& pci = {};
@@ -876,7 +875,8 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
     }
     // Network interfaces
     int net_num = 0;
-    for (const auto& [bridge_or_tap,macaddr,vhost]:options.net) {
+    bool has_user_net = false;
+    for (const auto& [net,macaddr,vhost]:options.net) {
         auto generate_macaddr_from_name = [](const std::string& vmname, int num) {
             std::string name = vmname + ":" + std::to_string(num);
             unsigned char buf[16];
@@ -891,45 +891,40 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
         };
         const auto net_id = "net" + std::to_string(net_num);
         const auto _macaddr = macaddr.value_or(generate_macaddr_from_name(vmname, net_num));
-        const auto netdev = [&net_id,&bridge_or_tap,&vhost]() {
-            if (std::holds_alternative<Bridge>(bridge_or_tap)) {
-                std::string bridge = std::get<Bridge>(bridge_or_tap);
+        std::string netdev = [&net_id,&net,&vhost]() {
+            if (std::holds_alternative<netif::type::User>(net)) {
+                return "user,id=" + net_id;
+            } else if (std::holds_alternative<netif::type::Bridge>(net)) {
+                std::string bridge = std::get<netif::type::Bridge>(net).name;
                 //return std::format("tap,id={},br={},helper=/usr/libexec/qemu-bridge-helper{}", net_id, bridge, vhost? ",vhost=on" : "");
                 //suspend using std::format as gcc12 doesn't support it
                 return "tap,id=" + net_id + ",br=" + bridge + ",helper=/usr/libexec/qemu-bridge-helper" + (vhost? ",vhost=on" : "");
-            } else if (std::holds_alternative<Tap>(bridge_or_tap)) {
-                std::string tap = std::get<Tap>(bridge_or_tap);
+            } else if (std::holds_alternative<netif::type::Tap>(net)) {
+                std::string tap = std::get<netif::type::Tap>(net).name;
                 //return std::format("tap,id={},ifname={},script=no,downscript=no{}", net_id, tap, vhost? ",vhost=on" : "");
                 return "tap,id=" + net_id + ",ifname=" + tap + ",script=no,downscript=no" + (vhost? ",vhost=on" : "");
+            } else if (std::holds_alternative<netif::type::Mcast>(net)) {
+                std::string mcast = std::get<netif::type::Mcast>(net).addr;
+                return "socket,id=" + net_id + ",mcast=" + mcast;
             }
             throw std::runtime_error("Invalid network type");
         }();
+
+        if (netdev.starts_with("user,")) {
+            if (has_user_net) throw std::runtime_error("Only one user network interface is allowed");
+            //else
+            std::string hostfwd_str;
+            for (const auto& hostfwd:options.hostfwd) {
+                hostfwd_str += ",hostfwd=" + hostfwd;
+            }
+            netdev += hostfwd_str;
+        }
         //const auto device = std::format("virtio-net-pci,romfile=,netdev={},mac={}", net_id, _macaddr);
         const auto device = "virtio-net-pci,romfile=,netdev=" + net_id + ",mac=" + _macaddr;
         // TODO: apply tap
         qemu_cmdline.insert(qemu_cmdline.end(), {
             "-netdev", netdev, 
             "-device", device
-        });
-        net_num++;
-    }
-    if (net_num == 0) {
-        // default host only network
-        std::string hostfwd_str;
-        for (const auto& hostfwd:options.hostfwd) {
-            hostfwd_str += ",hostfwd=" + hostfwd;
-        }
-        qemu_cmdline.insert(qemu_cmdline.end(), {
-            "-netdev", "user,id=net0" + hostfwd_str,
-            "-device", "virtio-net-pci,romfile=,netdev=net0"
-        });
-        net_num++;
-    }
-    for (const auto& netdev_mcast:options.netdev_mcast) {
-        auto netdev_name = "net" + std::to_string(net_num);
-        qemu_cmdline.insert(qemu_cmdline.end(), {
-            "-netdev", "socket,id=" + netdev_name + ",mcast=" + netdev_mcast,
-            "-device", "virtio-net-pci,netdev=" + netdev_name
         });
         net_num++;
     }
@@ -1229,7 +1224,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
 
     std::string type = iniparser_getstring(ini.get(), ":type", "genpack");
 
-    std::vector<std::tuple<std::variant<Bridge,Tap>,std::optional<std::string>,bool>> net;
+    std::vector<std::tuple<netif::type::Some,std::optional<std::string>,bool>> net;
     for (int i = 0; i < 10; i++) {
         auto section = "net" + std::to_string(i);
         if (iniparser_find_entry(ini.get(), section.c_str()) == 0) continue; // no corresponding section
@@ -1243,13 +1238,13 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
         else if (bridge_str && tap) throw std::runtime_error("Both bridge and tap for net" + std::to_string(i) + " are specified.");
         if (bridge_str) {
             net.push_back({
-                Bridge(bridge_str), 
+                netif::type::Bridge(bridge_str), 
                 mac? std::make_optional(std::string(mac)) : std::nullopt, 
                 vhost
             });
         } else if (tap) {
             net.push_back({
-                Tap(tap), 
+                netif::type::Tap(tap), 
                 mac? std::make_optional(std::string(mac)) : std::nullopt, 
                 vhost
             });
@@ -1257,7 +1252,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     }
 
     if (net.size() == 0 && bridge.has_value()) { // if no net section and default bridge given, add default netif
-        net.push_back({Bridge(*bridge), std::nullopt, true});
+        net.push_back({netif::type::Bridge(*bridge), std::nullopt, true});
     }
 
     // scan USB devices
@@ -1715,8 +1710,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("-d", "--data-file").nargs(1).help("Data file(or D drive image in BIOS mode)");
     run_command.add_argument("--volatile-data").default_value(false).implicit_value(true);
     run_command.add_argument("--cdrom").nargs(1);
-    run_command.add_argument("-b", "--bridge").nargs(1);
-    run_command.add_argument("-t", "--tap").nargs(1);
+    run_command.add_argument("-i", "--net").help("Network interface").append();
     run_command.add_argument("--hostfwd").help("pass hostfwd to QEMU").append();
     run_command.add_argument("--netdev-mcast").help("add virtual netif using multicast").append();
     run_command.add_argument("--virtiofs-path").nargs(1);
@@ -1813,17 +1807,16 @@ static int _main(int argc, char* argv[])
         auto virtiofs_path = run_command.present("--virtiofs-path");
         if (!std::filesystem::exists(system_file)) throw std::runtime_error(system_file + " does not exist.");
 
-        std::vector<std::tuple<std::variant<Bridge,Tap>,std::optional<std::string>,bool>> net;
-        auto bridge = run_command.present("-b");
-        auto tap = run_command.present("-t");
-        if (bridge) {
-            net.push_back({Bridge(*bridge), std::nullopt/*generate mac address automatically*/, true});
-        } else if (tap) {
-            net.push_back({Tap(*tap), std::nullopt/*generate mac address automatically*/, true});
+        std::vector<std::tuple<netif::type::Some,std::optional<std::string>,bool>> net;
+        for (const auto& i:run_command.get<std::vector<std::string>>("-i")) {
+            net.push_back({netif::to_netif(i), std::nullopt/*generate mac address automatically*/, true});
+        }
+        if (net.size() == 0) {
+            // if no --net given, add default netif
+            net.push_back({netif::type::User(), std::nullopt, true});
         }
 
         auto hostfwd = run_command.get<std::vector<std::string>>("--hostfwd");
-        auto netdev_mcast = run_command.get<std::vector<std::string>>("--netdev-mcast");
 
         auto real_data_file = (volatile_data || data_file.has_value())? 
                     std::make_optional(volatile_data? create_temporary_data_file() : std::filesystem::path(data_file.value()))
@@ -1843,7 +1836,6 @@ static int _main(int argc, char* argv[])
                     .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                     .net = net,
                     .hostfwd = hostfwd,
-                    .netdev_mcast = netdev_mcast,
                     .disks = disks,
                     .pci = pci,
                     .cdrom = run_command.present("--cdrom"),
@@ -1862,7 +1854,6 @@ static int _main(int argc, char* argv[])
                 .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                 .net = net,
                 .hostfwd = hostfwd,
-                .netdev_mcast = netdev_mcast,
                 .pci = pci,
                 .cdrom = run_command.present("--cdrom"),
                 .append = run_command.present("--append"),
