@@ -595,6 +595,7 @@ struct RunOptions {
     const std::optional<bool> kvm = std::nullopt;
     const std::vector<std::tuple<std::variant<Bridge,Tap>/*bridge or tap*/,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
     const std::vector<std::string> hostfwd = {};
+    const std::vector<std::string> netdev_mcast = {};
     const std::vector<std::filesystem::path>& usb = {};
     const std::vector<std::pair<std::filesystem::path,bool/*virtio*/>>& disks = {};
     const std::vector<std::string>& pci = {};
@@ -922,6 +923,15 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
             "-netdev", "user,id=net0" + hostfwd_str,
             "-device", "virtio-net-pci,romfile=,netdev=net0"
         });
+        net_num++;
+    }
+    for (const auto& netdev_mcast:options.netdev_mcast) {
+        auto netdev_name = "net" + std::to_string(net_num);
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-netdev", "socket,id=" + netdev_name + ",mcast=" + netdev_mcast,
+            "-device", "virtio-net-pci,netdev=" + netdev_name
+        });
+        net_num++;
     }
     // USB devices
     if (options.usb.size() > 0) {
@@ -1708,6 +1718,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("-b", "--bridge").nargs(1);
     run_command.add_argument("-t", "--tap").nargs(1);
     run_command.add_argument("--hostfwd").help("pass hostfwd to QEMU").append();
+    run_command.add_argument("--netdev-mcast").help("add virtual netif using multicast").append();
     run_command.add_argument("--virtiofs-path").nargs(1);
     run_command.add_argument("--no-kvm").default_value(false).implicit_value(true);
     run_command.add_argument("--append").nargs(1);
@@ -1812,6 +1823,8 @@ static int _main(int argc, char* argv[])
         }
 
         auto hostfwd = run_command.get<std::vector<std::string>>("--hostfwd");
+        auto netdev_stream = run_command.present("--netdev-stream");
+        auto netdev_mcast = run_command.get<std::vector<std::string>>("--netdev-mcast");
 
         auto real_data_file = (volatile_data || data_file.has_value())? 
                     std::make_optional(volatile_data? create_temporary_data_file() : std::filesystem::path(data_file.value()))
@@ -1831,6 +1844,7 @@ static int _main(int argc, char* argv[])
                     .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                     .net = net,
                     .hostfwd = hostfwd,
+                    .netdev_mcast = netdev_mcast,
                     .disks = disks,
                     .pci = pci,
                     .cdrom = run_command.present("--cdrom"),
@@ -1849,6 +1863,7 @@ static int _main(int argc, char* argv[])
                 .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                 .net = net,
                 .hostfwd = hostfwd,
+                .netdev_mcast = netdev_mcast,
                 .pci = pci,
                 .cdrom = run_command.present("--cdrom"),
                 .append = run_command.present("--append"),
