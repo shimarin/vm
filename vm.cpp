@@ -1823,7 +1823,6 @@ static int _main(int argc, char* argv[])
         }
 
         auto hostfwd = run_command.get<std::vector<std::string>>("--hostfwd");
-        auto netdev_stream = run_command.present("--netdev-stream");
         auto netdev_mcast = run_command.get<std::vector<std::string>>("--netdev-mcast");
 
         auto real_data_file = (volatile_data || data_file.has_value())? 
