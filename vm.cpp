@@ -594,7 +594,6 @@ struct RunOptions {
     const std::optional<bool> kvm = std::nullopt;
     const std::vector<std::tuple<netif::type::Some,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
     const std::vector<std::string> hostfwd = {};
-    //const std::vector<std::string> netdev_mcast = {};
     const std::vector<std::filesystem::path>& usb = {};
     const std::vector<std::pair<std::filesystem::path,bool/*virtio*/>>& disks = {};
     const std::vector<std::string>& pci = {};
@@ -1712,7 +1711,6 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--cdrom").nargs(1);
     run_command.add_argument("-i", "--net").help("Network interface").append();
     run_command.add_argument("--hostfwd").help("pass hostfwd to QEMU").append();
-    run_command.add_argument("--netdev-mcast").help("add virtual netif using multicast").append();
     run_command.add_argument("--virtiofs-path").nargs(1);
     run_command.add_argument("--no-kvm").default_value(false).implicit_value(true);
     run_command.add_argument("--append").nargs(1);
