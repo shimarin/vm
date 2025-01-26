@@ -952,6 +952,14 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
     }
     for (const auto& [name,file]:options.firmware_files) {
         if (name.find(',') != name.npos) throw std::runtime_error("Name cannot contain ','");
+        // check if file really exists and it's a regular file
+        if (!std::filesystem::exists(file) || !std::filesystem::is_regular_file(file)) {
+            throw std::runtime_error(file.string() + " does not exist or it's not a regular file");
+        }
+        // check if the file size is not too large
+        if (std::filesystem::file_size(file) > 1024 * 1024 * 4L/*4MB*/) {
+            throw std::runtime_error(file.string() + " is too large(make it less than 4MB)");
+        }
         qemu_cmdline.insert(qemu_cmdline.end(), {
             "-fw_cfg", "opt/" + name + ",file=" + file.string()
         });
@@ -1719,6 +1727,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--pci").nargs(1);
     run_command.add_argument("--no-shutdown").default_value(false).implicit_value(true);
     run_command.add_argument("system_file").nargs(1).help("System file (or C drive image in BIOS mode)");
+    run_command.add_argument("--application-ini").nargs(1).help("application.ini file to pass to VM");
     program.add_subparser(run_command);
 
     argparse::ArgumentParser service_command("service");
@@ -1821,6 +1830,11 @@ static int _main(int argc, char* argv[])
                     : std::nullopt;
         
         auto pci = run_command.get<std::vector<std::string>>("--pci");
+        auto application_ini = run_command.present("--application-ini");
+        std::map<std::string,std::filesystem::path> firmware_files;
+        if (application_ini.has_value()) {
+            firmware_files["application.ini"] = application_ini.value();
+        }
 
         if (run_command.get<bool>("--bios")) {
             auto virtio = !run_command.get<bool>("--no-virtio-for-bios-disks");
@@ -1840,7 +1854,8 @@ static int _main(int argc, char* argv[])
                     .display = run_command.present("--display"),
                     .hvc = run_command.get<bool>("--hvc"),
                     .stdio_console = true,
-                    .no_shutdown = run_command.get<bool>("--no-shutdown")
+                    .no_shutdown = run_command.get<bool>("--no-shutdown"),
+                    .firmware_files = firmware_files
                 } );
         }
         // else 
@@ -1858,7 +1873,8 @@ static int _main(int argc, char* argv[])
                 .display = run_command.present("--display"),
                 .hvc = run_command.get<bool>("--hvc"),
                 .stdio_console = true,
-                .no_shutdown = run_command.get<bool>("--no-shutdown")
+                .no_shutdown = run_command.get<bool>("--no-shutdown"),
+                .firmware_files = firmware_files
             } );
     }
 
