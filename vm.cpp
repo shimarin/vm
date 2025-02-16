@@ -40,6 +40,7 @@ extern "C" {
 
 #include "json_messaging.h"
 #include "netif.h"
+#include "pci.h"
 
 static const uint32_t default_memory_size = 2048;
 
@@ -819,8 +820,29 @@ static bool is_emulation_needed(const std::string& arch)
     return (arch != uts.machine);
 }
 
+struct qemu_os_resources {
+    std::optional<int> vm_run_dir_lock_fd;
+    std::optional<pid_t> virtiofsd_pid;
+    std::set<int> fds;
+    ~qemu_os_resources() {
+        for (auto fd:fds) close(fd);
+
+        if (virtiofsd_pid.has_value() && *virtiofsd_pid > 0) {
+            std::cout << "Shutting down virtiofsd..." << std::endl;
+            kill(*virtiofsd_pid, SIGTERM);
+            waitpid(*virtiofsd_pid, NULL, 0);
+        }
+
+        if (vm_run_dir_lock_fd.has_value() && *vm_run_dir_lock_fd >= 0) {
+            flock(*vm_run_dir_lock_fd, LOCK_UN);
+            close(*vm_run_dir_lock_fd);
+        }
+    }
+};
+
 static void apply_options_to_qemu_cmdline(const std::string& vmname, 
-    std::vector<std::string>& qemu_cmdline, const RunOptions& options, const std::string& arch, bool bios = false)
+    std::vector<std::string>& qemu_cmdline, const RunOptions& options, const std::string& arch, qemu_os_resources& os_resources,
+    bool bios = false)
 {
     // machine
     auto machine_type = [&arch,bios]() {
@@ -868,7 +890,18 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
             + (!bios && is_o_direct_supported(disk)? ",aio=native,cache.direct=on":"") });
     }
     // Passthrough PCI devices
-    for (const auto& pci : options.pci) {
+    std::vector<std::string> vfio_pci_devices;
+    // find SR-IOV VFs from network interfaces and make them available to the VM through vfio-pci
+    for (const auto& [net,macaddr,vhost]:options.net) {
+        // macaddr and vhost are not used here
+        if (!std::holds_alternative<netif::type::SRIOV>(net)) continue;
+        //else
+        auto sriov = std::get<netif::type::SRIOV>(net);
+        vfio_pci_devices.push_back(sriov.pci_id);
+    }
+    vfio_pci_devices.insert(vfio_pci_devices.end(), options.pci.begin(), options.pci.end());
+    for (const auto& pci : vfio_pci_devices) {
+        replace_driver_with_vfio(pci);
         qemu_cmdline.push_back("-device");
         qemu_cmdline.push_back("vfio-pci,host=" + pci);
     }
@@ -876,6 +909,7 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
     int net_num = 0;
     bool has_user_net = false;
     for (const auto& [net,macaddr,vhost]:options.net) {
+        if (std::holds_alternative<netif::type::SRIOV>(net)) continue; // Already handled
         auto generate_macaddr_from_name = [](const std::string& vmname, int num) {
             std::string name = vmname + ":" + std::to_string(num);
             unsigned char buf[16];
@@ -889,8 +923,8 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
             return std::string(mac_str);
         };
         const auto net_id = "net" + std::to_string(net_num);
-        const auto _macaddr = macaddr.value_or(generate_macaddr_from_name(vmname, net_num));
-        std::string netdev = [&net_id,&net,&vhost]() {
+        std::string _macaddr = macaddr.value_or(generate_macaddr_from_name(vmname, net_num));
+        std::string netdev = [&net_id,&net,&vhost,&_macaddr,&os_resources]() {
             if (std::holds_alternative<netif::type::User>(net)) {
                 return "user,id=" + net_id;
             } else if (std::holds_alternative<netif::type::Bridge>(net)) {
@@ -905,8 +939,14 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
             } else if (std::holds_alternative<netif::type::Mcast>(net)) {
                 std::string mcast = std::get<netif::type::Mcast>(net).addr;
                 return "socket,id=" + net_id + ",mcast=" + mcast;
-            }
-            throw std::runtime_error("Invalid network type");
+            } else if (std::holds_alternative<netif::type::MACVTAP>(net)) {
+                std::string macvtap = std::get<netif::type::MACVTAP>(net).name;
+                const auto [macaddr, fd] = netif::open_macvtap(macvtap);
+                _macaddr = macaddr;
+                os_resources.fds.insert(fd);
+                return "tap,id=" + net_id + ",fd=" + std::to_string(fd) + (vhost? ",vhost=on" : "");
+            } else
+                throw std::runtime_error("Invalid network type");
         }();
 
         if (netdev.starts_with("user,")) {
@@ -1054,14 +1094,13 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
     auto vmname = options.name.value_or((system_file? get_default_hostname(*system_file) : std::nullopt).value_or(generate_temporary_hostname()));
     std::filesystem::create_directories(vm_run_dir(vmname));
 
+    qemu_os_resources os_resources;
+
     //lock VM
     auto vm_lock_fd = lock_vm(vmname);
     if (vm_lock_fd < 0) throw std::runtime_error(vmname + " is already running");
     //else
-    Finally<int> vm_run_dir_lock([](auto fd){
-        flock(fd, LOCK_UN);
-        close(fd);
-    }, vm_lock_fd);
+    os_resources.vm_run_dir_lock_fd = vm_lock_fd;
 
     const auto [kernel, initramfs, arch] = extract_kernel_and_initramfs(system_file? *system_file : options.virtiofs_path.value());
     //std::cout << "Architecture: " << arch.value_or("Unknown") << std::endl;
@@ -1121,7 +1160,7 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
         qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("swapfile").string() + ",format=raw,readonly=on,media=disk,if=virtio,readonly=on"});
     }
 
-    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, arch.value());
+    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, arch.value(), os_resources);
 
     auto virtiofsd_pid = [&]() {
         if (!options.virtiofs_path.has_value()) return -1;
@@ -1133,13 +1172,7 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
         return pid;
     } ();
 
-    Finally<pid_t> virtiofsd([](auto pid) {
-        if (pid < 0) return;
-        //else
-        std::cout << "Shutting down virtiofsd..." << std::endl;
-        kill(pid, SIGTERM);
-        waitpid(pid, NULL, 0);
-    },  virtiofsd_pid);
+    if (virtiofsd_pid > 0) os_resources.virtiofsd_pid = virtiofsd_pid;
 
     std::cout << "Executing QEMU..." << std::endl;
     return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid);
@@ -1150,21 +1183,19 @@ static int run_bios(const RunOptions& options)
     auto vmname = options.name.value_or(generate_temporary_hostname());
     std::filesystem::create_directories(vm_run_dir(vmname));
 
+    qemu_os_resources os_resources;
     //lock VM
     auto vm_lock_fd = lock_vm(vmname);
     if (vm_lock_fd < 0) throw std::runtime_error(vmname + " is already running");
     //else
-    Finally<int> vm_run_dir_lock([](auto fd){
-        flock(fd, LOCK_UN);
-        close(fd);
-    }, vm_lock_fd);
+    os_resources.vm_run_dir_lock_fd = vm_lock_fd;
 
     std::vector<std::string> qemu_cmdline = {
         "qemu-system-x86_64"
     };
 
     apply_common_args_to_qemu_cmdline(vmname, qemu_cmdline);
-    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, "x86_64", true);
+    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, "x86_64", os_resources, true);
     if (options.cdrom.has_value()) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-boot", "once=d"});
     }
@@ -1179,13 +1210,7 @@ static int run_bios(const RunOptions& options)
         return pid;
     } ();
 
-    Finally<pid_t> virtiofsd([](auto pid) {
-        if (pid < 0) return;
-        //else
-        std::cout << "Shutting down virtiofsd..." << std::endl;
-        kill(pid, SIGTERM);
-        waitpid(pid, NULL, 0);
-    },  virtiofsd_pid);
+    if (virtiofsd_pid > 0) os_resources.virtiofsd_pid = virtiofsd_pid;
 
     std::cout << "Executing QEMU(BIOS)..." << std::endl;
     return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid);
@@ -1235,27 +1260,20 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     for (int i = 0; i < 10; i++) {
         auto section = "net" + std::to_string(i);
         if (iniparser_find_entry(ini.get(), section.c_str()) == 0) continue; // no corresponding section
-        auto bridge_str = iniparser_getstring(ini.get(), (section + ":bridge").c_str(), NULL);
-        auto tap = iniparser_getstring(ini.get(), (section + ":tap").c_str(), NULL);
+        auto interface = iniparser_getstring(ini.get(), (section + ":interface").c_str(), NULL);
+        if (!interface) interface = iniparser_getstring(ini.get(), (section + ":bridge").c_str(), NULL); // backward compatibility
+        if (!interface && i == 0 && bridge) interface = bridge.value().c_str();
         auto mac = iniparser_getstring(ini.get(), (section + ":mac").c_str(), NULL);
         bool vhost = (bool)iniparser_getboolean(ini.get(), (section + ":vhost").c_str(), 1);
 
-        if ((i > 0 || !bridge) && (!bridge_str && !tap)) throw std::runtime_error("Bridge or tap for net" + std::to_string(i) + " must be specified.");
-        if (!bridge_str && !tap) bridge_str = bridge.value().c_str();
-        else if (bridge_str && tap) throw std::runtime_error("Both bridge and tap for net" + std::to_string(i) + " are specified.");
-        if (bridge_str) {
-            net.push_back({
-                netif::type::Bridge(bridge_str), 
-                mac? std::make_optional(std::string(mac)) : std::nullopt, 
-                vhost
-            });
-        } else if (tap) {
-            net.push_back({
-                netif::type::Tap(tap), 
-                mac? std::make_optional(std::string(mac)) : std::nullopt, 
-                vhost
-            });
-        }
+        if (!interface) 
+            throw std::runtime_error("Interface for net" + std::to_string(i) + " must be specified.");
+        //else
+        net.push_back({
+            netif::to_netif(interface), 
+            mac? std::make_optional(std::string(mac)) : std::nullopt, 
+            vhost
+        });
     }
 
     if (net.size() == 0 && bridge.has_value()) { // if no net section and default bridge given, add default netif
