@@ -1246,7 +1246,8 @@ static std::string escape_comma_for_qemu(const std::string& str)
     return ret;
 }
 
-static int service(const std::string& vmname, const std::filesystem::path& vm_dir, std::optional<const std::string> bridge)
+static int service(const std::string& vmname, const std::filesystem::path& vm_dir, 
+    std::optional<const std::string> default_net)
 {
     if (vmname == "") throw std::runtime_error("VM name must not be empty.");
     if (!std::filesystem::exists(vm_dir)) throw std::runtime_error(vm_dir.string() + " does not exist.");
@@ -1282,7 +1283,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
         if (iniparser_find_entry(ini.get(), section.c_str()) == 0) continue; // no corresponding section
         auto interface = iniparser_getstring(ini.get(), (section + ":interface").c_str(), NULL);
         if (!interface) interface = iniparser_getstring(ini.get(), (section + ":bridge").c_str(), NULL); // backward compatibility
-        if (!interface && i == 0 && bridge) interface = bridge.value().c_str();
+        if (!interface && i == 0 && default_net) interface = default_net->c_str();
         auto mac = iniparser_getstring(ini.get(), (section + ":mac").c_str(), NULL);
         bool vhost = (bool)iniparser_getboolean(ini.get(), (section + ":vhost").c_str(), 1);
 
@@ -1296,8 +1297,12 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
         });
     }
 
-    if (net.size() == 0 && bridge.has_value()) { // if no net section and default bridge given, add default netif
-        net.push_back({netif::type::Bridge(*bridge), std::nullopt, true});
+    if (net.size() == 0) {
+        if (default_net) { // if no net section and default bridge given, add default netif
+            net.push_back({netif::type::Bridge(*default_net), std::nullopt, true});
+        } else {
+            net.push_back({netif::type::User(), std::nullopt, true});
+        }
     }
 
     // scan USB devices
@@ -1323,17 +1328,6 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     }
    
     // PCI passthrough
-    /*
-        e.g.
-        modprobe vfio-pci
-        echo -n "0000:01:00.0" > /sys/bus/pci/drivers/amdgpu/unbind
-        echo vfio-pci > /sys/bus/pci/devices/0000\:01\:00.0/driver_override
-        echo 0000:01:00.0 > /sys/bus/pci/drivers_probe
-
-        echo -n "0000:01:00.1" > /sys/bus/pci/drivers/snd_hda_intel/unbind
-        echo vfio-pci > /sys/bus/pci/devices/0000\:01\:00.1/driver_override
-        echo 0000:01:00.1 > /sys/bus/pci/drivers_probe
-    */
     std::vector<std::string> pci;
     for (int i = 0; i < 10; i++) {
         char buf[16];
@@ -1770,7 +1764,8 @@ static int _main(int argc, char* argv[])
 
     argparse::ArgumentParser service_command("service");
     service_command.add_description("Run VM as systemd service");
-    service_command.add_argument("-b", "--bridge").nargs(1).help("Bridge interface when network is not explicitly specified");
+    service_command.add_argument("-i", "--default-net").nargs(1).help("Nwtrosk interface when network is not explicitly specified");
+    service_command.add_argument("-b").nargs(1).help("Synonym for --default-net");
     service_command.add_argument("-n", "--name").nargs(1);
     service_command.add_argument("vm-dir").nargs(1);
     program.add_subparser(service_command);
@@ -1917,11 +1912,14 @@ static int _main(int argc, char* argv[])
     }
 
     if (program.is_subcommand_used("service")) {
-        const std::filesystem::path& vm_dir = service_command.get("vm-dir");
-        const std::optional<std::string>& vmname = service_command.present("--name");
+        const std::filesystem::path vm_dir = service_command.get("vm-dir");
+        const std::optional<std::string> vmname = service_command.present("--name");
+        auto default_net = service_command.present("--default-net");
+        if (!default_net) default_net = service_command.present("-b"); // for backward compatibility
+
         return service(
             vmname.value_or(std::filesystem::canonical(vm_dir).filename().string()),
-            vm_dir, service_command.present("-b"));
+            vm_dir, default_net);
     }
 
     if (program.is_subcommand_used("console")) {
