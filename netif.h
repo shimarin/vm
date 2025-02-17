@@ -16,8 +16,10 @@ namespace netif {
         };
         struct MACVTAP : public _namedif { MACVTAP(const std::string& _name) : _namedif(_name) {} };
         struct SRIOV {
-            SRIOV(const std::string& _pci_id) : pci_id(_pci_id) {} 
-            std::string pci_id;
+            SRIOV(const std::string& _pf_name, int _vf_start, int _vf_count) 
+                : pf_name(_pf_name), vf_start(_vf_start), vf_count(_vf_count) {}
+            std::string pf_name;
+            int vf_start, vf_count;
         };
 
         typedef std::variant<User,Bridge,Tap,Mcast,MACVTAP,SRIOV> Some;
@@ -26,4 +28,5 @@ namespace netif {
     type::Some to_netif(const std::string& ifname);
     bool make_interface_up(const std::string& ifname);
     std::tuple<std::string,int> open_macvtap(const std::string& ifname);
+    std::optional<std::string> get_vf_pci_id(const std::string& pf_name, int vf_number);
 }

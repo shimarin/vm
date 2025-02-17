@@ -26,11 +26,12 @@ int repl()
             } else if constexpr (std::is_same_v<T, netif::type::Mcast>) {
                 return std::format("Mcast: {}", arg.addr);
             } else if constexpr (std::is_same_v<T, netif::type::SRIOV>) {
-                return std::format("SRIOV: {}", arg.pci_id);
+                return std::format("SRIOV: {}(vf{}-{})", arg.pf_name, arg.vf_start, arg.vf_start + arg.vf_count - 1);
             }
             throw std::runtime_error("Unknown type");
         }, rst);
     }, pybind11::arg("ifname"));
+    builtins.attr("get_vf_pci_id") = pybind11::cpp_function(netif::get_vf_pci_id, pybind11::arg("ifname"), pybind11::arg("vf_num"));
     builtins.attr("make_interface_up") = pybind11::cpp_function(netif::make_interface_up, pybind11::arg("ifname"));
     builtins.attr("open_macvtap") = pybind11::cpp_function(netif::open_macvtap, pybind11::arg("ifname"));
 

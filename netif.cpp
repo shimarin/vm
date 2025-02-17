@@ -56,26 +56,41 @@ static bool is_macvtap(const std::string& ifname)
     return std::filesystem::is_directory(sysfs / ifname / "macvtap");
 }
 
-static std::optional<std::string> get_vf_pci_id(const std::string& name)
+std::optional<std::string> get_vf_pci_id(const std::string& pf_name, int vf_number)
 {
-    // sysfs for VFs may not exist if its driver is replaced by vfio-pci
-    // so we need to check by other means
-    // VF name ends with v[0-9]+
-    std::regex re(".+v[0-9]+$");
-    if (!std::regex_match(name, re)) return std::nullopt;
-    // extract PF name by stripping off v[0-9]+
-    auto pf_name = name.substr(0, name.find_last_of('v'));
-    auto vf_number = name.substr(name.find_last_of('v') + 1);
-    auto vf_dir = sysfs / pf_name / "device" / ("virtfn" + vf_number);
+    auto vf_dir = sysfs / pf_name / "device" / ("virtfn" + std::to_string(vf_number));
     if (!std::filesystem::is_directory(vf_dir)) return std::nullopt;
     //else
     auto pci_device_dir = std::filesystem::read_symlink(vf_dir);
     return pci_device_dir.filename().string();
 }
 
-static bool is_sriov(const std::string& ifname)
+static std::optional<std::tuple<std::string,int,int>> get_pf_and_vf_range(const std::string& name)
 {
-    return get_vf_pci_id(ifname).has_value();
+    // VF name ends with vx-y (x and y are numbers between 0 and 999)
+    std::regex re_single_vf("(.+)v([0-9]{1,3})$");
+    std::smatch match;
+    std::string pf_name;
+    int vf_starts, vf_ends;
+    if (std::regex_search(name, match, re_single_vf)) {
+        pf_name = match[1].str();
+        vf_starts = std::stoi(match[2]);
+        vf_ends = vf_starts;
+    } else {
+        std::regex re_vf_range("(.+)v([0-9]{1,3})-([0-9]{1,3})$");
+        if (!std::regex_search(name, match, re_vf_range)) return std::nullopt;
+        pf_name = match[1].str();
+        vf_starts = std::stoi(match[2]);
+        vf_ends = std::stoi(match[3]);
+    }
+    auto totalvfs = sysfs / pf_name / "device/sriov_totalvfs";
+    std::ifstream f(totalvfs);
+    if (!f) return std::nullopt;
+    int total;
+    f >> total;
+    if (vf_ends >= total) return std::nullopt; // vf_end is out of range
+    //else
+    return std::make_tuple(pf_name, vf_starts, vf_ends - vf_starts + 1);
 }
 
 type::Some to_netif(const std::string& ifname)
@@ -92,9 +107,10 @@ type::Some to_netif(const std::string& ifname)
         return type::MACVTAP(ifname);
     }
     //else
-    auto vf_pci_id = get_vf_pci_id(ifname);
-    if (vf_pci_id.has_value()) {
-        return type::SRIOV(vf_pci_id.value());
+    auto sriov_pd_and_vf_range = get_pf_and_vf_range(ifname);
+    if (sriov_pd_and_vf_range.has_value()) {
+        auto [pf_name, vf_start, vf_count] = sriov_pd_and_vf_range.value();
+        return type::SRIOV(pf_name, vf_start, vf_count);
     }
     //else
     throw std::runtime_error(ifname + " is not a valid network interface name");

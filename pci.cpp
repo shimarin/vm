@@ -1,5 +1,7 @@
-#include <unistd.h>
 #include <sys/wait.h>
+#include <sys/file.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include <filesystem>
 #include <fstream>
@@ -10,7 +12,7 @@ static std::filesystem::path pci_dir = "/sys/bus/pci";
 static auto pci_devices_dir = pci_dir / "devices";
 static bool modprobe_done = false;
 
-void modprobe_vfio_pci()
+static void modprobe_vfio_pci()
 {
     if (modprobe_done) return;
     //else
@@ -27,6 +29,8 @@ void modprobe_vfio_pci()
     }
     modprobe_done = true;
 }
+
+namespace pci {
 
 bool replace_driver_with_vfio(const std::string& pci_id)
 {
@@ -52,3 +56,23 @@ bool replace_driver_with_vfio(const std::string& pci_id)
     }
     return true;
 }
+
+int lock_pci_device(const std::string& pci_id)
+{
+    std::filesystem::path lock_dir("/run/vm/.pci-lock");
+    std::filesystem::create_directories(lock_dir);
+    auto lock_file = lock_dir / pci_id;
+
+    int fd = open(lock_file.c_str(), O_CREAT | O_RDWR, 0600);
+    if (fd < 0) {
+        throw std::runtime_error("Failed to create or open lock file");
+    }
+
+    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+        // lock has been already acquired, it seems
+        return -1;
+    }
+
+    return fd;  // lock acquired
+}
+} // namespace pci

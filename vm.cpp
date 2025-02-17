@@ -822,6 +822,7 @@ static bool is_emulation_needed(const std::string& arch)
 
 struct qemu_os_resources {
     std::optional<int> vm_run_dir_lock_fd;
+    std::vector<int> pci_locks;
     std::optional<pid_t> virtiofsd_pid;
     std::set<int> fds;
     ~qemu_os_resources() {
@@ -836,6 +837,11 @@ struct qemu_os_resources {
         if (vm_run_dir_lock_fd.has_value() && *vm_run_dir_lock_fd >= 0) {
             flock(*vm_run_dir_lock_fd, LOCK_UN);
             close(*vm_run_dir_lock_fd);
+        }
+
+        for (auto pci_lock:pci_locks) {
+            flock(pci_lock, LOCK_UN);
+            close(pci_lock);
         }
     }
 };
@@ -896,12 +902,26 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
         // macaddr and vhost are not used here
         if (!std::holds_alternative<netif::type::SRIOV>(net)) continue;
         //else
-        auto sriov = std::get<netif::type::SRIOV>(net);
-        vfio_pci_devices.push_back(sriov.pci_id);
+        auto [pf_name, vf_start, vf_count] = std::get<netif::type::SRIOV>(net);
+        int lock = -1; // no lock yet
+        for (int i = vf_start; i < vf_start + vf_count; i++) {
+            auto pci_id = netif::get_vf_pci_id(pf_name, i);
+            if (!pci_id) continue;
+            //else
+            lock = pci::lock_pci_device(*pci_id);
+            if (lock < 0) continue;
+            //else
+            os_resources.pci_locks.push_back(lock);
+            vfio_pci_devices.push_back(*pci_id);
+            break;
+        }
+        if (lock < 0) {
+            throw std::runtime_error("Failed to acquire SR-IOV VF from PF " + pf_name);
+        }
     }
     vfio_pci_devices.insert(vfio_pci_devices.end(), options.pci.begin(), options.pci.end());
     for (const auto& pci : vfio_pci_devices) {
-        replace_driver_with_vfio(pci);
+        pci::replace_driver_with_vfio(pci);
         qemu_cmdline.push_back("-device");
         qemu_cmdline.push_back("vfio-pci,host=" + pci);
     }
