@@ -1299,7 +1299,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
 
     if (net.size() == 0) {
         if (default_net) { // if no net section and default bridge given, add default netif
-            net.push_back({netif::type::Bridge(*default_net), std::nullopt, true});
+            net.push_back({netif::to_netif(*default_net), std::nullopt, true});
         } else {
             net.push_back({netif::type::User(), std::nullopt, true});
         }
