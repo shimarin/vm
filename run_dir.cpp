@@ -16,6 +16,10 @@ const std::filesystem::path& root()
              if (xdg_runtime_dir) _run_dir = (std::filesystem::path(xdg_runtime_dir) / "vm");
         }
         if (!_run_dir.has_value()) _run_dir = "/run/vm";
+
+        if (!std::filesystem::exists(*_run_dir)) {
+            std::filesystem::create_directory(*_run_dir);
+        }
     }
     return _run_dir.value();
 }
