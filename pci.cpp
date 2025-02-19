@@ -1,11 +1,16 @@
 #include <sys/wait.h>
 #include <sys/file.h>
+#include <sys/sysinfo.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <string.h>
 
 #include <filesystem>
 #include <fstream>
 #include <optional>
+#include <numeric>
+
+#include "run_dir.h"
 #include "pci.h"
 
 static std::filesystem::path pci_dir = "/sys/bus/pci";
@@ -57,22 +62,36 @@ bool replace_driver_with_vfio(const std::string& pci_id)
     return true;
 }
 
-int lock_pci_device(const std::string& pci_id)
+void acquire_iommu_memory(const std::string& vmname, uint32_t memory_to_newly_allocate_in_mb)
 {
-    std::filesystem::path lock_dir("/run/vm/.pci-lock");
-    std::filesystem::create_directories(lock_dir);
-    auto lock_file = lock_dir / pci_id;
+    struct sysinfo info;
+    if (sysinfo(&info) < 0) throw std::runtime_error("sysinfo() failed");
+    auto physical_memory_size_in_mb = static_cast<uint64_t>(info.totalram) * info.mem_unit / 1024 / 1024;
 
-    int fd = open(lock_file.c_str(), O_CREAT | O_RDWR, 0600);
-    if (fd < 0) {
-        throw std::runtime_error("Failed to create or open lock file");
+    auto iommu_mems = run_dir::for_each_running_vms<unsigned long>([](const std::string& vmname) {
+        auto fd = open(run_dir::iommu_mem(vmname).c_str(), O_RDONLY);
+        if (fd < 0) return (unsigned long)0;
+        flock(fd, LOCK_SH);
+        char buf[32];
+        read(fd, buf, sizeof(buf));
+        close(fd);
+        return std::stoul(buf);
+    });
+    auto iommu_mem_total = std::accumulate(iommu_mems.begin(), iommu_mems.end(), 0UL);
+    if (iommu_mem_total + memory_to_newly_allocate_in_mb > physical_memory_size_in_mb - 2048) {
+        throw std::runtime_error("IOMMU memory limit exceeded. Requested: " 
+            + std::to_string(memory_to_newly_allocate_in_mb) + "MB, Available: " 
+            + std::to_string(physical_memory_size_in_mb - iommu_mem_total - 2048) + "MB");
     }
-
-    if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
-        // lock has been already acquired, it seems
-        return -1;
-    }
-
-    return fd;  // lock acquired
+    //else
+    auto fd = open(run_dir::iommu_mem(vmname).c_str(), O_WRONLY|O_CREAT|O_TRUNC, 0644);
+    if (fd < 0) throw std::runtime_error("Failed to create iommu-mem file for " + vmname);
+    // lock the file
+    flock(fd, LOCK_EX);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%u", memory_to_newly_allocate_in_mb);
+    write(fd, buf, strlen(buf));
+    close(fd);
 }
+
 } // namespace pci

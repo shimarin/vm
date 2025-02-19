@@ -38,6 +38,7 @@ extern "C" {
 #include <squashfuse/squashfuse.h>
 }
 
+#include "run_dir.h"
 #include "json_messaging.h"
 #include "netif.h"
 #include "pci.h"
@@ -83,11 +84,6 @@ static void MD5(const uint8_t* data, size_t length, uint8_t result[16])
 
     if (read(opfd, result, 16) == -1) 
         throw std::runtime_error("MD5: read() failed");
-}
-
-static bool is_root_user()
-{
-    return (getuid() == 0);
 }
 
 static std::filesystem::path user_home_dir()
@@ -502,31 +498,6 @@ static std::string generate_temporary_hostname()
     return hostname;
 }
 
-static const std::filesystem::path& run_dir()
-{
-    static std::optional<std::filesystem::path> _run_dir = std::nullopt;
-    if (!_run_dir.has_value()) {
-        if (!is_root_user()) {
-            const auto xdg_runtime_dir = getenv("XDG_RUNTIME_DIR");
-             if (xdg_runtime_dir) _run_dir = (std::filesystem::path(xdg_runtime_dir) / "vm");
-        }
-        if (!_run_dir.has_value()) _run_dir = "/run/vm";
-    }
-    return _run_dir.value();
-}
-
-static std::filesystem::path vm_run_dir(const std::string& vmname)
-{
-    return run_dir() / vmname;
-}
-
-static auto qemu_pid(const std::string& vmname) {return vm_run_dir(vmname) / "qemu.pid";}
-static auto qmp_sock(const std::string& vmname) {return vm_run_dir(vmname) / "qmp.sock";}
-static auto monitor_sock(const std::string& vmname) {return vm_run_dir(vmname) / "monitor.sock";}
-static auto console_sock(const std::string& vmname) {return vm_run_dir(vmname) / "console.sock";}
-static auto qga_sock(const std::string& vmname) {return vm_run_dir(vmname) / "qga.sock";}
-static auto virtiofs_sock(const std::string& vmname) {return vm_run_dir(vmname) / "virtiofs.sock";}
-
 static int sock_connect(const std::filesystem::path& sock_path)
 {
     struct sockaddr_un sockaddr;
@@ -543,7 +514,7 @@ static int sock_connect(const std::filesystem::path& sock_path)
     return sock;
 }
 
-static auto qmp_connect(const std::string& vmname) {return sock_connect(qmp_sock(vmname));}
+static auto qmp_connect(const std::string& vmname) {return sock_connect(run_dir::qmp_sock(vmname));}
 
 static bool qmp_ping(const std::string& vmname)
 {
@@ -612,19 +583,6 @@ struct RunOptions {
     const std::optional<std::string> virtiofs_inode_file_handles = {};
 };
 
-static int lock_vm(const std::string& vmname)
-{
-    auto vm_run_dir_fd = open(vm_run_dir(vmname).c_str(), O_RDONLY, 0);
-    if (vm_run_dir_fd < 0) throw std::runtime_error(std::string("open(") + vm_run_dir(vmname).string() + ") failed");
-
-    if (flock(vm_run_dir_fd, LOCK_EX|LOCK_NB) < 0) {
-        close(vm_run_dir_fd);
-        if (errno == EWOULDBLOCK) return -1;
-        else throw std::runtime_error(std::string("flock(") + vm_run_dir(vmname).string() + ") failed");
-    }
-    return vm_run_dir_fd;
-}
-
 struct VirtiofsdOptions {
     const std::optional<uint64_t> rlimit_nofile = std::nullopt;
     const std::optional<std::string> cache = std::nullopt;
@@ -633,7 +591,7 @@ struct VirtiofsdOptions {
 
 static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::path& path, const VirtiofsdOptions& options)
 {
-    auto sock = virtiofs_sock(vmname);
+    auto sock = run_dir::virtiofs_sock(vmname);
     try {
         std::filesystem::remove(sock);
     }
@@ -642,7 +600,7 @@ static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::pat
     if (pid < 0) throw std::runtime_error("fork() failed");
     if (pid == 0) {
         std::vector<std::string> args;
-        if (!is_root_user()) {
+        if (getuid() != 0) {
             args.insert(args.end(), {
                 "/usr/bin/podman", "unshare"
             });
@@ -684,7 +642,7 @@ static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::pat
 
 static std::optional<std::filesystem::path> generate_ssh_host_keys_archive(const std::string& vmname)
 {
-    auto ssh_host_key_root = vm_run_dir(vmname) / "ssh-host-key";
+    auto ssh_host_key_root = run_dir::vm_dir(vmname) / "ssh-host-key";
     auto ssh_host_key_dir = ssh_host_key_root / "etc" / "ssh";
     std::filesystem::create_directories(ssh_host_key_dir);
 
@@ -786,12 +744,12 @@ static void apply_common_args_to_qemu_cmdline(const std::string& vmname, std::ve
 {
     qemu_cmdline.insert(qemu_cmdline.end(), {
         "-nodefaults", "-device", "usb-ehci", "-device", "usb-kbd", "-device", "usb-tablet", "-rtc", "base=utc",
-        "-monitor", "unix:" + monitor_sock(vmname).string() + ",server,nowait",
-        "-qmp", "unix:" + qmp_sock(vmname).string() + ",server,nowait",
-        "-chardev", "socket,path=" + qga_sock(vmname).string() + ",server=on,wait=off,id=qga0",
+        "-monitor", "unix:" + run_dir::monitor_sock(vmname).string() + ",server,nowait",
+        "-qmp", "unix:" + run_dir::qmp_sock(vmname).string() + ",server,nowait",
+        "-chardev", "socket,path=" + run_dir::qga_sock(vmname).string() + ",server=on,wait=off,id=qga0",
         "-device", "virtio-serial", "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
         "-fw_cfg", "opt/vmname,string=" + vmname,
-        "-pidfile", qemu_pid(vmname)
+        "-pidfile", run_dir::qemu_pid(vmname)
     });
 
     // generate ssh host key which valid till next reboot
@@ -877,12 +835,12 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
     if (options.hvc) {
         qemu_cmdline.insert(qemu_cmdline.end(), {
             "-device", "virtio-serial-pci", "-device", "virtconsole,chardev=hvc",
-            "-chardev", (options.stdio_console? "stdio,signal=off,id=hvc" : "socket,path=" + console_sock(vmname).string() + ",server=on,wait=off,id=hvc")
+            "-chardev", (options.stdio_console? "stdio,signal=off,id=hvc" : "socket,path=" + run_dir::console_sock(vmname).string() + ",server=on,wait=off,id=hvc")
         }); 
     } else {
         qemu_cmdline.insert(qemu_cmdline.end(), {
             "-serial",
-            (options.stdio_console? "mon:stdio" : "unix:" + console_sock(vmname).string() + ",server=on,wait=off")
+            (options.stdio_console? "mon:stdio" : "unix:" + run_dir::console_sock(vmname).string() + ",server=on,wait=off")
         });
     }
     // Number of CPU core
@@ -908,7 +866,7 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
             auto pci_id = netif::get_vf_pci_id(pf_name, i);
             if (!pci_id) continue;
             //else
-            lock = pci::lock_pci_device(*pci_id);
+            lock = run_dir::lock_pci(*pci_id);
             if (lock < 0) continue;
             //else
             os_resources.pci_locks.push_back(lock);
@@ -1033,7 +991,7 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
 static void apply_virtiofs_to_qemu_cmdline(const std::string& vmname, std::vector<std::string>& qemu_cmdline, pid_t virtiofsd_pid)
 {
     qemu_cmdline.insert(qemu_cmdline.end(), {
-        "-chardev", "socket,id=virtiofs,path=" + virtiofs_sock(vmname).string(),
+        "-chardev", "socket,id=virtiofs,path=" + run_dir::virtiofs_sock(vmname).string(),
         "-device", "vhost-user-fs-pci,queue-size=1024,chardev=virtiofs,tag=fs"
     });
 }
@@ -1112,12 +1070,11 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
     if (!system_file && !options.virtiofs_path) throw std::runtime_error("virtiofs_path is required if system_file is not provided");
 
     auto vmname = options.name.value_or((system_file? get_default_hostname(*system_file) : std::nullopt).value_or(generate_temporary_hostname()));
-    std::filesystem::create_directories(vm_run_dir(vmname));
 
     qemu_os_resources os_resources;
 
     //lock VM
-    auto vm_lock_fd = lock_vm(vmname);
+    auto vm_lock_fd = run_dir::lock_vm(vmname);
     if (vm_lock_fd < 0) throw std::runtime_error(vmname + " is already running");
     //else
     os_resources.vm_run_dir_lock_fd = vm_lock_fd;
@@ -1182,6 +1139,14 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
 
     apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, arch.value(), os_resources);
 
+    // if VM uses PCI-passthrough, create iommu-mem file and write memory size to it
+    bool iommu = options.pci.size() > 0 || std::any_of(options.net.begin(), options.net.end(), [](const auto& t) {
+        return std::holds_alternative<netif::type::SRIOV>(std::get<0>(t));
+    });
+    if (iommu) {
+        pci::acquire_iommu_memory(vmname, options.memory);
+    }
+
     auto virtiofsd_pid = [&]() {
         if (!options.virtiofs_path.has_value()) return -1;
         //else
@@ -1201,11 +1166,10 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
 static int run_bios(const RunOptions& options)
 {
     auto vmname = options.name.value_or(generate_temporary_hostname());
-    std::filesystem::create_directories(vm_run_dir(vmname));
 
     qemu_os_resources os_resources;
     //lock VM
-    auto vm_lock_fd = lock_vm(vmname);
+    auto vm_lock_fd = run_dir::lock_vm(vmname);
     if (vm_lock_fd < 0) throw std::runtime_error(vmname + " is already running");
     //else
     os_resources.vm_run_dir_lock_fd = vm_lock_fd;
@@ -1423,7 +1387,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
 
 static int console(const std::string& vmname)
 {
-    auto sock = sock_connect(console_sock(vmname));
+    auto sock = sock_connect(run_dir::console_sock(vmname));
     if (sock < 0) throw std::runtime_error("No console port for VM " + vmname + ".");
 
     Finally<int> sock_close([](int sock) {
@@ -1534,7 +1498,7 @@ static std::optional<std::tuple<
 
     pid_t pid = -1;
     uint64_t uptime_ms = 0, utime_ms = 0;
-    std::ifstream(qemu_pid(vmname)) >> pid;
+    std::ifstream(run_dir::qemu_pid(vmname)) >> pid;
     if (pid > 0) {
         auto process_stat = get_process_stat(pid);
         if (process_stat.has_value()) {
@@ -1549,13 +1513,10 @@ static std::optional<std::tuple<
 
 static std::vector<std::tuple<std::string,uint64_t,uint16_t,uint64_t,uint64_t>> collect_running_vm_info()
 {
-    std::vector<std::future<std::optional<std::tuple<std::string,uint64_t,uint16_t,uint64_t,uint64_t>>>> threads;
-    if (std::filesystem::exists(run_dir()) && std::filesystem::is_directory(run_dir())) {
-        for (const auto& entry : std::filesystem::directory_iterator(run_dir())) {
-            if (!entry.is_directory()) continue;
-            threads.push_back(std::async(check_running_vm, entry.path().filename()));
-        }
-    }
+    using thread = std::future<std::optional<std::tuple<std::string,uint64_t,uint16_t,uint64_t,uint64_t>>>;
+    auto threads = run_dir::for_each_running_vms<thread>([](const std::string& vmname) {
+        return std::async(check_running_vm, vmname);
+    });
 
     std::vector<std::tuple<std::string,uint64_t,uint16_t,uint64_t,uint64_t>> vms;
     for (auto& thread : threads) {
@@ -1580,13 +1541,13 @@ static int show(std::optional<std::string> vmname)
         obj["cpus"] = cpus;
         obj["uptime_ms"] = uptime_ms;
         obj["utime_ms"] = utime_ms;
-        obj["qmp"] = qmp_sock(vmname);
-        obj["monitor"] = monitor_sock(vmname);
-        if (std::filesystem::exists(console_sock(vmname))) {
-            obj["console"] = console_sock(vmname);
+        obj["qmp"] = run_dir::qmp_sock(vmname);
+        obj["monitor"] = run_dir::monitor_sock(vmname);
+        if (std::filesystem::exists(run_dir::console_sock(vmname))) {
+            obj["console"] = run_dir::console_sock(vmname);
         }
-        obj["qemu-pid"] = qemu_pid(vmname);
-        obj["qga"] = qga_sock(vmname);
+        obj["qemu-pid"] = run_dir::qemu_pid(vmname);
+        obj["qga"] = run_dir::qga_sock(vmname);
     };
 
     if (vmname.has_value()) {
