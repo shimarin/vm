@@ -572,6 +572,7 @@ struct RunOptions {
     const std::optional<std::filesystem::path>& cdrom = std::nullopt;
     const std::optional<std::string>& append = std::nullopt;
     const std::optional<std::string>& display = std::nullopt;
+    const std::optional<std::string>& spice = std::nullopt;
     const bool hvc = false;
     const bool stdio_console = false;
     const bool no_shutdown = false;
@@ -829,7 +830,16 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
         "-object", "memory-backend-memfd,id=mem,size=" + std::to_string(options.memory) + "M,share=on", "-numa", "node,memdev=mem",
         "-display", options.display.value_or("none")
     });
-    if (options.display) qemu_cmdline.insert(qemu_cmdline.end(), {"-vga", "virtio"});
+    if (options.spice) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-spice", options.spice.value(),
+            "-chardev", "spicevmc,id=vdagent,name=vdagent",
+            "-device", "virtio-serial-pci", "-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0",
+            "-audiodev", "spice,id=snd0",
+            "-device", "virtio-sound-pci,audiodev=snd0"
+        });
+    }
+    if (options.display || options.spice) qemu_cmdline.insert(qemu_cmdline.end(), {"-vga", "virtio"});
 
     // Console (Legacy serial, or HVC)
     if (options.hvc) {
@@ -1716,6 +1726,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--no-kvm").default_value(false).implicit_value(true);
     run_command.add_argument("--append").nargs(1);
     run_command.add_argument("--display").nargs(1);
+    run_command.add_argument("--spice").nargs(1);
     run_command.add_argument("--hvc").default_value(false).implicit_value(true);
     run_command.add_argument("--pci").nargs(1);
     run_command.add_argument("--no-shutdown").default_value(false).implicit_value(true);
@@ -1846,6 +1857,7 @@ static int _main(int argc, char* argv[])
                     .pci = pci,
                     .cdrom = run_command.present("--cdrom"),
                     .display = run_command.present("--display"),
+                    .spice = run_command.present("--spice"),
                     .hvc = run_command.get<bool>("--hvc"),
                     .stdio_console = true,
                     .no_shutdown = run_command.get<bool>("--no-shutdown"),
@@ -1865,6 +1877,7 @@ static int _main(int argc, char* argv[])
                 .cdrom = run_command.present("--cdrom"),
                 .append = run_command.present("--append"),
                 .display = run_command.present("--display"),
+                .spice = run_command.present("--spice"),
                 .hvc = run_command.get<bool>("--hvc"),
                 .stdio_console = true,
                 .no_shutdown = run_command.get<bool>("--no-shutdown"),
