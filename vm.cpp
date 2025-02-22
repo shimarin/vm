@@ -573,6 +573,7 @@ struct RunOptions {
     const std::optional<std::string>& append = std::nullopt;
     const std::optional<std::string>& display = std::nullopt;
     const std::optional<std::string>& spice = std::nullopt;
+    const uint16_t gpu_max_outputs = 1;
     const bool hvc = false;
     const bool stdio_console = false;
     const bool no_shutdown = false;
@@ -582,6 +583,9 @@ struct RunOptions {
     const std::optional<uint64_t> virtiofs_rlimit_nofile = {};
     const std::optional<std::string> virtiofs_cache = {};
     const std::optional<std::string> virtiofs_inode_file_handles = {};
+    const std::optional<std::string>& logging_items = std::nullopt;
+    const std::optional<std::string>& trace = std::nullopt;
+    const std::optional<std::filesystem::path>& logfile = std::nullopt;
 };
 
 struct VirtiofsdOptions {
@@ -809,6 +813,21 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
     std::vector<std::string>& qemu_cmdline, const RunOptions& options, const std::string& arch, qemu_os_resources& os_resources,
     bool bios = false)
 {
+    // name
+    qemu_cmdline.push_back("-name");
+    qemu_cmdline.push_back(vmname);
+
+    // logging
+    if (options.logging_items) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-d", *options.logging_items});
+    }
+    if (options.trace) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-trace", *options.trace});
+    }
+    if (options.logfile) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-D", options.logfile->string()});
+    }
+
     // machine
     auto machine_type = [&arch,bios]() {
         if (arch == "x86_64") return bios? "q35" : "pc";
@@ -824,22 +843,30 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
     qemu_cmdline.push_back("-cpu");
     qemu_cmdline.push_back(kvm? "host" : "max");
 
-    // memory, display
+    // memory
     qemu_cmdline.insert(qemu_cmdline.end(), {
         "-m", std::to_string(options.memory),
         "-object", "memory-backend-memfd,id=mem,size=" + std::to_string(options.memory) + "M,share=on", "-numa", "node,memdev=mem",
-        "-display", options.display.value_or("none")
     });
+
+    // display
     if (options.spice) {
         qemu_cmdline.insert(qemu_cmdline.end(), {
+            //"-vga", "qxl", // unstable. Never use it.
+            "-display", options.display.value_or("egl-headless"),
+            "-device", "virtio-gpu,max_outputs=" + std::to_string(options.gpu_max_outputs),
             "-spice", options.spice.value(),
             "-chardev", "spicevmc,id=vdagent,name=vdagent",
             "-device", "virtio-serial-pci", "-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0",
             "-audiodev", "spice,id=snd0",
             "-device", "virtio-sound-pci,audiodev=snd0"
         });
+    } else if (options.display) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-display", *options.display});
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-vga", "virtio"});
+    } else {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-display", "none"});
     }
-    if (options.display || options.spice) qemu_cmdline.insert(qemu_cmdline.end(), {"-vga", "virtio"});
 
     // Console (Legacy serial, or HVC)
     if (options.hvc) {
@@ -1290,6 +1317,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
 
     auto append = iniparser_getstring(ini.get(), ":append", NULL);
     auto display = iniparser_getstring(ini.get(), ":display", NULL);
+    auto spice = iniparser_getstring(ini.get(), ":spice", NULL);
+    auto gpu_max_outputs = (uint16_t)iniparser_getint(ini.get(), ":gpu_max_outputs", 1);
 
     std::vector<std::pair<std::filesystem::path,bool>> disks;
     for (int i = 0; i < 10; i++) {
@@ -1362,6 +1391,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .cdrom = cdrom,
                 .append = append? std::make_optional(append) : std::nullopt,
                 .display = display? std::make_optional(display) : std::nullopt,
+                .spice = spice? std::make_optional(spice) : std::nullopt,
+                .gpu_max_outputs = gpu_max_outputs,
                 .stdio_console = false,
                 .firmware_strings = firmware_strings,
                 .firmware_files = firmware_files,
@@ -1382,6 +1413,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .pci = pci,
                 .cdrom = cdrom,
                 .display = display? std::make_optional(display) : std::nullopt,
+                .spice = spice? std::make_optional(spice) : std::nullopt,
+                .gpu_max_outputs = gpu_max_outputs,
                 .stdio_console = false,
                 .firmware_strings = firmware_strings,
                 .firmware_files = firmware_files,
@@ -1727,11 +1760,15 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--append").nargs(1);
     run_command.add_argument("--display").nargs(1);
     run_command.add_argument("--spice").nargs(1);
+    run_command.add_argument("--gpu-max-outputs").nargs(1).scan<'u',uint16_t>().default_value<uint16_t>(1);
     run_command.add_argument("--hvc").default_value(false).implicit_value(true);
     run_command.add_argument("--pci").nargs(1);
     run_command.add_argument("--no-shutdown").default_value(false).implicit_value(true);
     run_command.add_argument("system_file").nargs(1).help("System file (or C drive image in BIOS mode)");
     run_command.add_argument("--application-ini").nargs(1).help("application.ini file to pass to VM");
+    run_command.add_argument("--logging-items").nargs(1).help("Logging items to pass to QEMU");
+    run_command.add_argument("--trace").nargs(1).help("Tracing options for QEMU");
+    run_command.add_argument("--logfile").nargs(1).help("Log file to output instead of stderr");
     program.add_subparser(run_command);
 
     argparse::ArgumentParser service_command("service");
@@ -1858,10 +1895,14 @@ static int _main(int argc, char* argv[])
                     .cdrom = run_command.present("--cdrom"),
                     .display = run_command.present("--display"),
                     .spice = run_command.present("--spice"),
+                    .gpu_max_outputs = run_command.get<uint16_t>("--gpu-max-outputs"),
                     .hvc = run_command.get<bool>("--hvc"),
                     .stdio_console = true,
                     .no_shutdown = run_command.get<bool>("--no-shutdown"),
-                    .firmware_files = firmware_files
+                    .firmware_files = firmware_files,
+                    .logging_items = run_command.present("--logging-items"),
+                    .trace = run_command.present("--trace"),
+                    .logfile = run_command.present("--logfile")
                 } );
         }
         // else 
@@ -1878,10 +1919,14 @@ static int _main(int argc, char* argv[])
                 .append = run_command.present("--append"),
                 .display = run_command.present("--display"),
                 .spice = run_command.present("--spice"),
+                .gpu_max_outputs = run_command.get<uint16_t>("--gpu-max-outputs"),
                 .hvc = run_command.get<bool>("--hvc"),
                 .stdio_console = true,
                 .no_shutdown = run_command.get<bool>("--no-shutdown"),
-                .firmware_files = firmware_files
+                .firmware_files = firmware_files,
+                .logging_items = run_command.present("--logging-items"),
+                .trace = run_command.present("--trace"),
+                .logfile = run_command.present("--logfile")
             } );
     }
 
