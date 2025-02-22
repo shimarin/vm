@@ -574,6 +574,7 @@ struct RunOptions {
     const std::optional<std::string>& display = std::nullopt;
     const std::optional<std::string>& spice = std::nullopt;
     const uint16_t gpu_max_outputs = 1;
+    const std::optional<std::string>& rendernode = std::nullopt;
     const bool hvc = false;
     const bool stdio_console = false;
     const bool no_shutdown = false;
@@ -853,7 +854,7 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
     if (options.spice) {
         qemu_cmdline.insert(qemu_cmdline.end(), {
             //"-vga", "qxl", // unstable. Never use it.
-            "-display", options.display.value_or("egl-headless"),
+            "-display", options.display.value_or("egl-headless" + (options.rendernode? ",rendernode=" + *options.rendernode : "")),
             "-device", "virtio-gpu,max_outputs=" + std::to_string(options.gpu_max_outputs),
             "-spice", options.spice.value(),
             "-chardev", "spicevmc,id=vdagent,name=vdagent",
@@ -1319,6 +1320,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     auto display = iniparser_getstring(ini.get(), ":display", NULL);
     auto spice = iniparser_getstring(ini.get(), ":spice", NULL);
     auto gpu_max_outputs = (uint16_t)iniparser_getint(ini.get(), ":gpu_max_outputs", 1);
+    auto rendernode = iniparser_getstring(ini.get(), ":rendernode", NULL);
 
     std::vector<std::pair<std::filesystem::path,bool>> disks;
     for (int i = 0; i < 10; i++) {
@@ -1393,6 +1395,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .display = display? std::make_optional(display) : std::nullopt,
                 .spice = spice? std::make_optional(spice) : std::nullopt,
                 .gpu_max_outputs = gpu_max_outputs,
+                .rendernode = rendernode? std::make_optional(rendernode) : std::nullopt,
                 .stdio_console = false,
                 .firmware_strings = firmware_strings,
                 .firmware_files = firmware_files,
@@ -1415,6 +1418,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .display = display? std::make_optional(display) : std::nullopt,
                 .spice = spice? std::make_optional(spice) : std::nullopt,
                 .gpu_max_outputs = gpu_max_outputs,
+                .rendernode = rendernode? std::make_optional(rendernode) : std::nullopt,
                 .stdio_console = false,
                 .firmware_strings = firmware_strings,
                 .firmware_files = firmware_files,
@@ -1761,6 +1765,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--display").nargs(1);
     run_command.add_argument("--spice").nargs(1);
     run_command.add_argument("--gpu-max-outputs").nargs(1).scan<'u',uint16_t>().default_value<uint16_t>(1);
+    run_command.add_argument("--rendernode").nargs(1).help("DRM render node to pass to QEMU");
     run_command.add_argument("--hvc").default_value(false).implicit_value(true);
     run_command.add_argument("--pci").nargs(1);
     run_command.add_argument("--no-shutdown").default_value(false).implicit_value(true);
@@ -1896,6 +1901,7 @@ static int _main(int argc, char* argv[])
                     .display = run_command.present("--display"),
                     .spice = run_command.present("--spice"),
                     .gpu_max_outputs = run_command.get<uint16_t>("--gpu-max-outputs"),
+                    .rendernode = run_command.present("--rendernode"),
                     .hvc = run_command.get<bool>("--hvc"),
                     .stdio_console = true,
                     .no_shutdown = run_command.get<bool>("--no-shutdown"),
@@ -1920,6 +1926,7 @@ static int _main(int argc, char* argv[])
                 .display = run_command.present("--display"),
                 .spice = run_command.present("--spice"),
                 .gpu_max_outputs = run_command.get<uint16_t>("--gpu-max-outputs"),
+                .rendernode = run_command.present("--rendernode"),
                 .hvc = run_command.get<bool>("--hvc"),
                 .stdio_console = true,
                 .no_shutdown = run_command.get<bool>("--no-shutdown"),
