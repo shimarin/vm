@@ -573,6 +573,14 @@ struct RunOptions {
     const std::optional<std::string>& append = std::nullopt;
     const std::optional<std::string>& display = std::nullopt;
     const std::optional<std::string>& spice = std::nullopt;
+    enum class accel_t { _2d, opengl, vulkan };
+    static accel_t to_accel(const std::string& accel) {
+        if (accel == "2d") return accel_t::_2d;
+        if (accel == "opengl") return accel_t::opengl;
+        if (accel == "vulkan") return accel_t::vulkan;
+        throw std::runtime_error("Invalid accel: " + accel);
+    }
+    const accel_t accel = accel_t::_2d;
     const uint16_t gpu_max_outputs = 1;
     const std::optional<std::string>& rendernode = std::nullopt;
     const bool hvc = false;
@@ -852,10 +860,13 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
 
     // display
     if (options.spice) {
+        std::string graphics_device = options.accel == RunOptions::accel_t::_2d? "virtio-gpu" : "virtio-gpu-gl,iommu_platform=on,hostmem=2G,blob=true";
+        if (options.accel == RunOptions::accel_t::vulkan) graphics_device += ",venus=true";
+        graphics_device += ",max_outputs=" + std::to_string(options.gpu_max_outputs);
         qemu_cmdline.insert(qemu_cmdline.end(), {
             //"-vga", "qxl", // unstable. Never use it.
             "-display", options.display.value_or("egl-headless" + (options.rendernode? ",rendernode=" + *options.rendernode : "")),
-            "-device", "virtio-gpu,max_outputs=" + std::to_string(options.gpu_max_outputs),
+            "-device", graphics_device,
             "-spice", options.spice.value(),
             "-chardev", "spicevmc,id=vdagent,name=vdagent",
             "-device", "virtio-serial-pci", "-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0",
@@ -1319,6 +1330,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     auto append = iniparser_getstring(ini.get(), ":append", NULL);
     auto display = iniparser_getstring(ini.get(), ":display", NULL);
     auto spice = iniparser_getstring(ini.get(), ":spice", NULL);
+    auto accel = RunOptions::to_accel(iniparser_getstring(ini.get(), ":accel", "2d"));
     auto gpu_max_outputs = (uint16_t)iniparser_getint(ini.get(), ":gpu_max_outputs", 1);
     auto rendernode = iniparser_getstring(ini.get(), ":rendernode", NULL);
 
@@ -1394,6 +1406,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .append = append? std::make_optional(append) : std::nullopt,
                 .display = display? std::make_optional(display) : std::nullopt,
                 .spice = spice? std::make_optional(spice) : std::nullopt,
+                .accel = accel,
                 .gpu_max_outputs = gpu_max_outputs,
                 .rendernode = rendernode? std::make_optional(rendernode) : std::nullopt,
                 .stdio_console = false,
@@ -1417,6 +1430,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .cdrom = cdrom,
                 .display = display? std::make_optional(display) : std::nullopt,
                 .spice = spice? std::make_optional(spice) : std::nullopt,
+                .accel = accel,
                 .gpu_max_outputs = gpu_max_outputs,
                 .rendernode = rendernode? std::make_optional(rendernode) : std::nullopt,
                 .stdio_console = false,
@@ -1764,6 +1778,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--append").nargs(1);
     run_command.add_argument("--display").nargs(1);
     run_command.add_argument("--spice").nargs(1);
+    run_command.add_argument("--accel").help("Graphics acceraration(2d|opengl|vulkan)").default_value(RunOptions::accel_t::_2d).action(RunOptions::to_accel);
     run_command.add_argument("--gpu-max-outputs").nargs(1).scan<'u',uint16_t>().default_value<uint16_t>(1);
     run_command.add_argument("--rendernode").nargs(1).help("DRM render node to pass to QEMU");
     run_command.add_argument("--hvc").default_value(false).implicit_value(true);
@@ -1900,6 +1915,7 @@ static int _main(int argc, char* argv[])
                     .cdrom = run_command.present("--cdrom"),
                     .display = run_command.present("--display"),
                     .spice = run_command.present("--spice"),
+                    .accel = run_command.get<RunOptions::accel_t>("--accel"),
                     .gpu_max_outputs = run_command.get<uint16_t>("--gpu-max-outputs"),
                     .rendernode = run_command.present("--rendernode"),
                     .hvc = run_command.get<bool>("--hvc"),
@@ -1925,6 +1941,7 @@ static int _main(int argc, char* argv[])
                 .append = run_command.present("--append"),
                 .display = run_command.present("--display"),
                 .spice = run_command.present("--spice"),
+                .accel = run_command.get<RunOptions::accel_t>("--accel"),
                 .gpu_max_outputs = run_command.get<uint16_t>("--gpu-max-outputs"),
                 .rendernode = run_command.present("--rendernode"),
                 .hvc = run_command.get<bool>("--hvc"),
