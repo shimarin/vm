@@ -573,8 +573,9 @@ struct RunOptions {
     const std::optional<std::string>& append = std::nullopt;
     const std::optional<std::string>& display = std::nullopt;
     const std::optional<std::string>& spice = std::nullopt;
-    enum class accel_t { _2d, opengl, vulkan };
+    enum class accel_t { qxl, _2d, opengl, vulkan };
     static accel_t to_accel(const std::string& accel) {
+        if (accel == "qxl") return accel_t::qxl;
         if (accel == "2d") return accel_t::_2d;
         if (accel == "opengl") return accel_t::opengl;
         if (accel == "vulkan") return accel_t::vulkan;
@@ -860,11 +861,16 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
 
     // display
     if (options.spice) {
-        std::string graphics_device = options.accel == RunOptions::accel_t::_2d? "virtio-gpu" : "virtio-gpu-gl,iommu_platform=on,hostmem=2G,blob=true";
-        if (options.accel == RunOptions::accel_t::vulkan) graphics_device += ",venus=true";
-        graphics_device += ",max_outputs=" + std::to_string(options.gpu_max_outputs);
+        auto graphics_device = [](const auto& accel, const auto gpu_max_outputs) -> std::string {
+            if (accel == RunOptions::accel_t::_2d) return "virtio-gpu";
+            if (accel == RunOptions::accel_t::qxl) return "qxl,vgamem_mb=128";
+            //else
+            std::string device("virtio-gpu-gl,iommu_platform=on,hostmem=2G,blob=true");
+            if (accel == RunOptions::accel_t::vulkan) device += ",venus=true";
+            device += ",max_outputs=" + std::to_string(gpu_max_outputs);
+            return device;
+        }(options.accel, options.gpu_max_outputs);
         qemu_cmdline.insert(qemu_cmdline.end(), {
-            //"-vga", "qxl", // unstable. Never use it.
             "-display", options.display.value_or("egl-headless" + (options.rendernode? ",rendernode=" + *options.rendernode : "")),
             "-device", graphics_device,
             "-spice", options.spice.value(),
