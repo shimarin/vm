@@ -1024,7 +1024,7 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
                     throw std::runtime_error("Failed to unbind USB device " + dev.string());
                 }
             }
-
+            std::cout << "Passing through USB device " << dev.string() << std::endl;
             qemu_cmdline.insert(qemu_cmdline.end(), {
                 "-device", "usb-host,hostdevice=" + dev.string()
             });

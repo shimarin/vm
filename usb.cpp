@@ -79,7 +79,7 @@ struct USBDeviceProperties {
     std::optional<std::string> product_name;
 };
 
-static USBDeviceProperties get_usb_device_properties(const std::string& device_path) {
+static std::optional<USBDeviceProperties> get_usb_device_properties(const std::string& device_path) {
     USBDeviceProperties properties = {};
 
     // Control transfer to get device descriptor
@@ -94,7 +94,8 @@ static USBDeviceProperties get_usb_device_properties(const std::string& device_p
     };
     int fd = open(device_path.c_str(), O_RDWR);
     if (fd < 0) {
-        throw std::runtime_error("Failed to open device");
+        free(ctrl.data);
+        return std::nullopt;
     }
     if (ioctl(fd, USBDEVFS_CONTROL, &ctrl) < 0) {
         free(ctrl.data);
@@ -141,21 +142,21 @@ static std::shared_ptr<xmlpp::Document> get_usb_devices_xml()
             auto device_path = device_entry.path().string();
             auto device_id = device_entry.path().filename().string();
             auto device_properties = get_usb_device_properties(device_path);
-            if (looks_like_a_root_hub(device_properties)) continue; // skip root hubs
+            if (!device_properties || looks_like_a_root_hub(*device_properties)) continue; // skip root hubs
             auto device_element = bus_element->add_child_element("device");
             device_element->set_attribute("path", device_path);
             device_element->set_attribute("id", bus_id + ":" + device_id);
             device_element->set_attribute("bus_id", std::to_string(std::stoi(bus_id)));
             device_element->set_attribute("device_id", std::to_string(std::stoi(device_id)));
-            device_element->set_attribute("vendor_id", to_hex(device_properties.vendor_id));
-            device_element->set_attribute("product_id", to_hex(device_properties.product_id));
-            device_element->set_attribute("device_revision", to_hex(device_properties.device_revision));
-            device_element->set_attribute("device_class", std::to_string(device_properties.device_class));
-            device_element->set_attribute("device_subclass", std::to_string(device_properties.device_subclass));
-            if (device_properties.vendor_name)
-                device_element->set_attribute("vendor_name", *device_properties.vendor_name);
-            if (device_properties.product_name)
-                device_element->set_attribute("product_name", *device_properties.product_name);
+            device_element->set_attribute("vendor_id", to_hex(device_properties->vendor_id));
+            device_element->set_attribute("product_id", to_hex(device_properties->product_id));
+            device_element->set_attribute("device_revision", to_hex(device_properties->device_revision));
+            device_element->set_attribute("device_class", std::to_string(device_properties->device_class));
+            device_element->set_attribute("device_subclass", std::to_string(device_properties->device_subclass));
+            if (device_properties->vendor_name)
+                device_element->set_attribute("vendor_name", *device_properties->vendor_name);
+            if (device_properties->product_name)
+                device_element->set_attribute("product_name", *device_properties->product_name);
         }
     }
 
