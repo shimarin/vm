@@ -574,6 +574,7 @@ struct RunOptions {
     const std::optional<std::string>& append = std::nullopt;
     const std::optional<std::string>& display = std::nullopt;
     const std::optional<std::string>& spice = std::nullopt;
+    const std::optional<std::string>& vnc = std::nullopt;
     enum class accel_t { qxl, _2d, opengl, vulkan };
     static accel_t to_accel(const std::string& accel) {
         if (accel == "qxl") return accel_t::qxl;
@@ -861,7 +862,7 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
     });
 
     // display
-    if (options.spice) {
+    if (options.spice || options.vnc) {
         auto graphics_device = [](const auto& accel, const auto gpu_max_outputs) -> std::string {
             if (accel == RunOptions::accel_t::_2d) return "virtio-gpu";
             if (accel == RunOptions::accel_t::qxl) return "qxl,vgamem_mb=128";
@@ -874,12 +875,17 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
         qemu_cmdline.insert(qemu_cmdline.end(), {
             "-display", options.display.value_or("egl-headless" + (options.rendernode? ",rendernode=" + *options.rendernode : "")),
             "-device", graphics_device,
-            "-spice", options.spice.value(),
             "-chardev", "spicevmc,id=vdagent,name=vdagent",
             "-device", "virtio-serial-pci", "-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0",
             "-audiodev", "spice,id=snd0",
             "-device", "virtio-sound-pci,audiodev=snd0"
         });
+        if (options.spice) {
+            qemu_cmdline.insert(qemu_cmdline.end(), {"-spice", *options.spice});
+        }
+        if (options.vnc) {
+            qemu_cmdline.insert(qemu_cmdline.end(), {"-vnc", *options.vnc});
+        }
     } else if (options.display) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-display", *options.display});
         qemu_cmdline.insert(qemu_cmdline.end(), {"-vga", "virtio"});
@@ -1355,6 +1361,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     auto append = iniparser_getstring(ini.get(), ":append", NULL);
     auto display = iniparser_getstring(ini.get(), ":display", NULL);
     auto spice = iniparser_getstring(ini.get(), ":spice", NULL);
+    auto vnc = iniparser_getstring(ini.get(), ":vnc", NULL);
     auto accel = RunOptions::to_accel(iniparser_getstring(ini.get(), ":accel", "2d"));
     auto gpu_max_outputs = (uint16_t)iniparser_getint(ini.get(), ":gpu_max_outputs", 1);
     auto rendernode = iniparser_getstring(ini.get(), ":rendernode", NULL);
@@ -1803,6 +1810,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--append").nargs(1);
     run_command.add_argument("--display").nargs(1);
     run_command.add_argument("--spice").nargs(1);
+    run_command.add_argument("--vnc").nargs(1);
     run_command.add_argument("--accel").help("Graphics acceraration(2d|opengl|vulkan)").default_value(RunOptions::accel_t::_2d).action(RunOptions::to_accel);
     run_command.add_argument("--gpu-max-outputs").nargs(1).scan<'u',uint16_t>().default_value<uint16_t>(1);
     run_command.add_argument("--rendernode").nargs(1).help("DRM render node to pass to QEMU");
@@ -1952,6 +1960,7 @@ static int _main(int argc, char* argv[])
                     .cdrom = run_command.present("--cdrom"),
                     .display = run_command.present("--display"),
                     .spice = run_command.present("--spice"),
+                    .vnc = run_command.present("--vnc"),
                     .accel = run_command.get<RunOptions::accel_t>("--accel"),
                     .gpu_max_outputs = run_command.get<uint16_t>("--gpu-max-outputs"),
                     .rendernode = run_command.present("--rendernode"),
@@ -1979,6 +1988,7 @@ static int _main(int argc, char* argv[])
                 .append = run_command.present("--append"),
                 .display = run_command.present("--display"),
                 .spice = run_command.present("--spice"),
+                .vnc = run_command.present("--vnc"),
                 .accel = run_command.get<RunOptions::accel_t>("--accel"),
                 .gpu_max_outputs = run_command.get<uint16_t>("--gpu-max-outputs"),
                 .rendernode = run_command.present("--rendernode"),
