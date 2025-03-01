@@ -75,6 +75,8 @@ struct USBDeviceProperties {
     uint16_t device_revision;
     uint8_t device_class;
     uint8_t device_subclass;
+    uint16_t usb_version;       // USB version
+    int speed;                  // USB speed
     std::optional<std::string> vendor_name;
     std::optional<std::string> product_name;
 };
@@ -108,6 +110,15 @@ static std::optional<USBDeviceProperties> get_usb_device_properties(const std::s
     properties.device_revision = device_descriptor->bcdDevice;
     properties.device_class = device_descriptor->bDeviceClass;
     properties.device_subclass = device_descriptor->bDeviceSubClass;
+    properties.usb_version = device_descriptor->bcdUSB;
+
+    // Get USB speed
+    int speed;
+    if (ioctl(fd, USBDEVFS_GET_SPEED, &speed) < 0) {
+        properties.speed = USB_SPEED_UNKNOWN; // Unknown speed
+    } else {
+        properties.speed = speed;
+    }
 
     // Get string descriptors
     properties.vendor_name = get_string_descriptor(fd, device_descriptor->iManufacturer);
@@ -116,6 +127,17 @@ static std::optional<USBDeviceProperties> get_usb_device_properties(const std::s
     free(ctrl.data);
     close(fd);
     return properties;
+}
+
+static std::string speed_to_string(int speed)
+{
+    switch (speed) {
+        case USB_SPEED_LOW:    return "Low (1.5 Mbps)";
+        case USB_SPEED_FULL:   return "Full (12 Mbps)";
+        case USB_SPEED_HIGH:   return "High (480 Mbps)";
+        case USB_SPEED_SUPER:  return "Super (5 Gbps)";
+        default:               return "Unknown";
+    }
 }
 
 static bool looks_like_a_root_hub(const USBDeviceProperties& properties) {
@@ -153,6 +175,8 @@ static std::shared_ptr<xmlpp::Document> get_usb_devices_xml()
             device_element->set_attribute("device_revision", to_hex(device_properties->device_revision));
             device_element->set_attribute("device_class", std::to_string(device_properties->device_class));
             device_element->set_attribute("device_subclass", std::to_string(device_properties->device_subclass));
+            device_element->set_attribute("usb_version", to_hex(device_properties->usb_version));
+            device_element->set_attribute("speed", speed_to_string(device_properties->speed));
             if (device_properties->vendor_name)
                 device_element->set_attribute("vendor_name", *device_properties->vendor_name);
             if (device_properties->product_name)
@@ -160,6 +184,14 @@ static std::shared_ptr<xmlpp::Document> get_usb_devices_xml()
         }
     }
 
+    // Remove buses without devices
+    auto empty_buses = root_element->find("//bus[not(device)]");
+    for (const auto& node : empty_buses) {
+        if (auto* bus = dynamic_cast<xmlpp::Element*>(node)) {
+            root_element->remove_node(bus);
+        }
+    }
+    
     return doc;
 }
 
