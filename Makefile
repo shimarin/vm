@@ -1,10 +1,12 @@
 PREFIX ?= /usr/local
 PYTHON ?= python3
+CFLAGS=-std=c++20 `pkg-config --cflags libxml++-5.0`
+LIBS=-liniparser -lsystemd -lsmartcols -lsquashfuse `pkg-config --libs libxml++-5.0`
 
 all: vm.bin mirrortap.bin vm.so
 
-vm.bin: vm.cpp json_messaging.cpp netif.cpp pci.cpp run_dir.cpp
-	g++ -std=c++20 -D__USE_REAL_MAIN__ -o $@ $^ -liniparser -lsystemd -lsmartcols -lsquashfuse
+vm.bin: vm.cpp json_messaging.cpp netif.cpp pci.cpp run_dir.cpp usb.cpp
+	g++ -D__USE_REAL_MAIN__ -o $@ $^ $(CFLAGS) $(LIBS)
 
 vm.so: vm.cpp json_messaging.cpp netif.cpp pci.cpp run_dir.cpp
 	g++ -std=c++20 -g -shared -fPIC -o $@ $^

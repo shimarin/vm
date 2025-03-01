@@ -42,6 +42,7 @@ extern "C" {
 #include "json_messaging.h"
 #include "netif.h"
 #include "pci.h"
+#include "usb.h"
 
 static const uint32_t default_memory_size = 2048;
 
@@ -1004,6 +1005,20 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
     if (options.usb.size() > 0) {
         qemu_cmdline.push_back("-usb");
         for (const auto& dev:options.usb) {
+            // dev is a path to the USB device like /dev/bus/usb/001/002 (001=bus id, 002=device id)
+            auto bus_id = std::stoi(dev.parent_path().filename().string());
+            auto dev_id = std::stoi(dev.filename().string());
+            auto unbind_file = std::filesystem::path("/sys/bus/usb/devices") / (std::to_string(bus_id) + "-" + std::to_string(dev_id)) / "driver/unbind";
+            if (std::filesystem::exists(unbind_file)) {
+                {
+                    std::ofstream ofs(unbind_file);
+                    ofs << std::to_string(bus_id) + "-" + std::to_string(dev_id);
+                }
+                if (std::filesystem::exists(unbind_file)) {
+                    throw std::runtime_error("Failed to unbind USB device " + dev.string());
+                }
+            }
+
             qemu_cmdline.insert(qemu_cmdline.end(), {
                 "-device", "usb-host,hostdevice=" + dev.string()
             });
@@ -1324,8 +1339,12 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
         }
     }
 
+    auto usb_query = iniparser_getstring(ini.get(), ":usb", NULL);
+    // query USB devices using XPath
+    std::vector<std::filesystem::path> usb = usb_query? query_usb_devices(usb_query) : std::vector<std::filesystem::path>();
+
     // scan USB devices
-    std::vector<std::filesystem::path> usb;
+    // scan symlink to /dev/bus/usb/xxx/yyy
     for (int i = 0; i < 10; i++) {
         auto device = vm_dir / ("usb" + std::to_string(i));
         if (std::filesystem::exists(device) && std::filesystem::is_character_file(device)) {
@@ -1789,6 +1808,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--rendernode").nargs(1).help("DRM render node to pass to QEMU");
     run_command.add_argument("--hvc").default_value(false).implicit_value(true);
     run_command.add_argument("--pci").nargs(1);
+    run_command.add_argument("--usb").nargs(1).help("XPath query to specify USB devices to passthrough");
     run_command.add_argument("--no-shutdown").default_value(false).implicit_value(true);
     run_command.add_argument("system_file").nargs(1).help("System file (or C drive image in BIOS mode)");
     run_command.add_argument("--application-ini").nargs(1).help("application.ini file to pass to VM");
@@ -1839,6 +1859,11 @@ static int _main(int argc, char* argv[])
     expand_command.add_argument("vmname").nargs(1);
     program.add_subparser(expand_command);
 
+    argparse::ArgumentParser usb_command("usb");
+    usb_command.add_description("USB device management");
+    program.add_subparser(usb_command);
+    usb_command.add_argument("-q", "--query").help("XPath query to test finding USB devices");
+
     try {
         program.parse_args(argc, argv);
     }
@@ -1862,6 +1887,8 @@ static int _main(int argc, char* argv[])
             std::cerr << allocate_command;
         } else if (program.is_subcommand_used("expand")) {
             std::cerr << expand_command;
+        } else if (program.is_subcommand_used("usb")) {
+            std::cerr << usb_command;
         } else {
             std::cerr << program;
         }
@@ -1893,6 +1920,9 @@ static int _main(int argc, char* argv[])
 
         auto hostfwd = run_command.get<std::vector<std::string>>("--hostfwd");
 
+        std::vector<std::filesystem::path> usb = run_command.present("--usb")?
+            query_usb_devices(run_command.get<std::string>("--usb")) : std::vector<std::filesystem::path>();
+
         auto real_data_file = (volatile_data || data_file.has_value())? 
                     std::make_optional(volatile_data? create_temporary_data_file() : std::filesystem::path(data_file.value()))
                     : std::nullopt;
@@ -1916,6 +1946,7 @@ static int _main(int argc, char* argv[])
                     .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                     .net = net,
                     .hostfwd = hostfwd,
+                    .usb = usb,
                     .disks = disks,
                     .pci = pci,
                     .cdrom = run_command.present("--cdrom"),
@@ -1942,6 +1973,7 @@ static int _main(int argc, char* argv[])
                 .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                 .net = net,
                 .hostfwd = hostfwd,
+                .usb = usb,
                 .pci = pci,
                 .cdrom = run_command.present("--cdrom"),
                 .append = run_command.present("--append"),
@@ -2039,6 +2071,24 @@ static int _main(int argc, char* argv[])
     if (program.is_subcommand_used("expand")) {
         auto vmname = expand_command.get("vmname");
         return expand(vmname);
+    }
+
+    if (program.is_subcommand_used("usb")) {
+        auto query = usb_command.present("--query");
+        if (query) {
+            auto devices = query_usb_devices(*query);
+            for (const auto& device:devices) {
+                std::cout << device.string() << std::endl;
+            }
+            if (devices.size() == 0) {
+                std::cout << "No USB devices found." << std::endl;
+            }
+            return 0;
+        }
+        //else
+        print_usb_devices_xml();
+        print_example_query();
+        return 0;
     }
 
     std::cout << program;
