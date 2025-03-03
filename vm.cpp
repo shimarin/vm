@@ -863,15 +863,17 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
 
     // display
     if (options.spice || options.vnc) {
-        auto graphics_device = [](const auto& accel, const auto gpu_max_outputs) -> std::string {
+        std::string graphics_device = [](const auto& accel) -> std::string {
             if (accel == RunOptions::accel_t::_2d) return "virtio-gpu";
             if (accel == RunOptions::accel_t::qxl) return "qxl,vgamem_mb=128";
             //else
             std::string device("virtio-gpu-gl,iommu_platform=on,hostmem=2G,blob=true");
             if (accel == RunOptions::accel_t::vulkan) device += ",venus=true";
-            device += ",max_outputs=" + std::to_string(gpu_max_outputs);
             return device;
-        }(options.accel, options.gpu_max_outputs);
+        }(options.accel);
+        if (options.gpu_max_outputs > 1) {
+            graphics_device += ",max_outputs=" + std::to_string(options.gpu_max_outputs);
+        }
         qemu_cmdline.insert(qemu_cmdline.end(), {
             "-display", options.display.value_or("egl-headless" + (options.rendernode? ",rendernode=" + *options.rendernode : "")),
             "-device", graphics_device,
