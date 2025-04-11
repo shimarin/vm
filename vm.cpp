@@ -1320,6 +1320,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     std::string type = iniparser_getstring(ini.get(), ":type", "genpack");
 
     std::vector<std::tuple<netif::type::Some,std::optional<std::string>,bool>> net;
+    std::vector<std::string> hostfwd;
+    bool has_user_net = false;
     for (int i = 0; i < 10; i++) {
         auto section = "net" + std::to_string(i);
         if (iniparser_find_entry(ini.get(), section.c_str()) == 0) continue; // no corresponding section
@@ -1332,8 +1334,32 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
         if (!interface) 
             throw std::runtime_error("Interface for net" + std::to_string(i) + " must be specified.");
         //else
+
+        auto netif_v = netif::to_netif(interface);
+        if (std::holds_alternative<netif::type::User>(netif_v)) {
+            if (has_user_net) throw std::runtime_error("Only one user network interface is allowed");
+            //else
+            has_user_net = true;
+
+            auto hostfwd_cstr = iniparser_getstring(ini.get(), (section + ":hostfwd").c_str(), NULL);
+            if (hostfwd_cstr) {
+                std::string hostfwd_str = hostfwd_cstr;
+                std::string::size_type pos = 0;
+                while ((pos = hostfwd_str.find(',')) != std::string::npos) {
+                    auto fwd = hostfwd_str.substr(0, pos);
+                    if (fwd.find(':') == std::string::npos) throw std::runtime_error("Invalid hostfwd format");
+                    //else
+                    hostfwd.push_back(fwd);
+                    hostfwd_str.erase(0, pos + 1);
+                }
+                if (hostfwd_str.find(':') == std::string::npos) throw std::runtime_error("Invalid hostfwd format");
+                //else
+                hostfwd.push_back(hostfwd_str);
+            }
+        }
+
         net.push_back({
-            netif::to_netif(interface), 
+            netif_v, 
             mac? std::make_optional(std::string(mac)) : std::nullopt, 
             vhost
         });
@@ -1433,6 +1459,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .memory = memory,
                 .cpus = cpus,
                 .net = net,
+                .hostfwd = hostfwd,
                 .usb = usb,
                 .disks = disks,
                 .pci = pci,
@@ -1458,6 +1485,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .memory = memory,
                 .cpus = cpus,
                 .net = net,
+                .hostfwd = hostfwd,
                 .usb = usb,
                 .disks = disks,
                 .pci = pci,
