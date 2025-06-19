@@ -822,6 +822,24 @@ struct qemu_os_resources {
     }
 };
 
+static std::string get_system_timezone()
+{
+    std::array<char, 128> buffer;
+    std::string result;
+    auto deleter = [](FILE* fp) { pclose(fp); };
+    std::unique_ptr<FILE, decltype(deleter)> pipe(popen("timedatectl show -p Timezone --value", "r"), deleter);
+    if (!pipe) {
+        return "Error: Failed to execute command";
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        result += buffer.data();
+    }
+    if (!result.empty() && result.back() == '\n') {
+        result.pop_back();
+    }
+    return result;
+}
+
 static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname, 
     std::vector<std::string>& qemu_cmdline, const RunOptions& options, const std::string& arch, qemu_os_resources& os_resources,
     bool bios = false)
@@ -1047,6 +1065,22 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
         });
     }
 
+    // pass timezone(read from /etc/timezone) to the VM
+    const auto timezone = get_system_timezone();
+    if (!timezone.empty()) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-fw_cfg", "opt/timezone,string=" + timezone
+        });
+    }
+
+    // pass lang to the VM
+    const auto lang = getenv("LANG");
+    if (lang && strlen(lang) > 0) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-fw_cfg", "opt/lang,string=" + std::string(lang)
+        });
+    }
+
     // strings/files to be passed through fw_cfg
     for (const auto& [name,string]:options.firmware_strings) {
         if (name.find(',') != name.npos) throw std::runtime_error("Name cannot contain ','");
@@ -1068,7 +1102,7 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
             "-fw_cfg", "opt/" + name + ",file=" + file.string()
         });
     }
-
+    
     if (options.no_shutdown) {
         qemu_cmdline.push_back("-no-shutdown");
     }
