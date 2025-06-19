@@ -4,6 +4,7 @@
 #include <pybind11/stl.h>
 
 #include "netif.h"
+#include "vsock.h"
 
 int myfunc()
 {
@@ -20,13 +21,15 @@ int repl()
         return std::visit([](auto&& arg) -> std::string {
             using T = std::decay_t<decltype(arg)>;
             if constexpr (std::is_base_of_v<netif::type::_namedif, T>) {
-                return std::format("{}: {}", typeid(T).name(), arg.name);
+                //return std::format("{}: {}", typeid(T).name(), arg.name);
+                return typeid(T).name() + std::string(": ") + arg.name;
             } else if constexpr (std::is_same_v<T, netif::type::User>) {
-                "User";
+                return "User";
             } else if constexpr (std::is_same_v<T, netif::type::Mcast>) {
-                return std::format("Mcast: {}", arg.addr);
+                return "Mcast: " + arg.addr;
+                //return std::format("Mcast: {}", arg.addr);
             } else if constexpr (std::is_same_v<T, netif::type::SRIOV>) {
-                return std::format("SRIOV: {}(vf{}-{})", arg.pf_name, arg.vf_start, arg.vf_start + arg.vf_count - 1);
+                return "SRIOV: " + arg.pf_name + "(vf" + std::to_string(arg.vf_start) + "-" + std::to_string(arg.vf_start + arg.vf_count - 1) + ")";
             }
             throw std::runtime_error("Unknown type");
         }, rst);
@@ -34,6 +37,9 @@ int repl()
     builtins.attr("get_vf_pci_id") = pybind11::cpp_function(netif::get_vf_pci_id, pybind11::arg("ifname"), pybind11::arg("vf_num"));
     builtins.attr("make_interface_up") = pybind11::cpp_function(netif::make_interface_up, pybind11::arg("ifname"));
     builtins.attr("open_macvtap") = pybind11::cpp_function(netif::open_macvtap, pybind11::arg("ifname"));
+    builtins.attr("determine_guest_cid") = pybind11::cpp_function([](const std::string& vmname) {
+        return vsock::determine_guest_cid(vmname);
+    }, pybind11::arg("vmname"));
 
     pybind11::exec(R"(
 import code,readline,rlcompleter

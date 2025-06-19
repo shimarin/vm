@@ -43,6 +43,7 @@ extern "C" {
 #include "netif.h"
 #include "pci.h"
 #include "usb.h"
+#include "vsock.h"
 
 static const uint32_t default_memory_size = 2048;
 
@@ -821,7 +822,7 @@ struct qemu_os_resources {
     }
 };
 
-static void apply_options_to_qemu_cmdline(const std::string& vmname, 
+static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname, 
     std::vector<std::string>& qemu_cmdline, const RunOptions& options, const std::string& arch, qemu_os_resources& os_resources,
     bool bios = false)
 {
@@ -1009,6 +1010,13 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
         });
         net_num++;
     }
+
+    // vsock
+    uint32_t guest_cid = vsock::determine_guest_cid(vmname);
+    qemu_cmdline.insert(qemu_cmdline.end(), {
+        "-device", "vhost-vsock-pci,guest-cid=" + std::to_string(guest_cid)
+    });
+
     // USB devices
     if (options.usb.size() > 0) {
         qemu_cmdline.push_back("-usb");
@@ -1064,6 +1072,8 @@ static void apply_options_to_qemu_cmdline(const std::string& vmname,
     if (options.no_shutdown) {
         qemu_cmdline.push_back("-no-shutdown");
     }
+
+    return guest_cid;
 }
 
 static void apply_virtiofs_to_qemu_cmdline(const std::string& vmname, std::vector<std::string>& qemu_cmdline, pid_t virtiofsd_pid)
@@ -1215,7 +1225,7 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
         qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("swapfile").string() + ",format=raw,readonly=on,media=disk,if=virtio,readonly=on"});
     }
 
-    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, arch.value(), os_resources);
+    auto guest_cid = apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, arch.value(), os_resources);
 
     // if VM uses PCI-passthrough, create iommu-mem file and write memory size to it
     bool iommu = options.pci.size() > 0 || std::any_of(options.net.begin(), options.net.end(), [](const auto& t) {
@@ -1238,6 +1248,8 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
     if (virtiofsd_pid > 0) os_resources.virtiofsd_pid = virtiofsd_pid;
 
     std::cout << "Executing QEMU..." << std::endl;
+    std::cout << "Guest CID: " << guest_cid << std::endl;
+    std::cout << "`ssh -o ProxyCommand='socat STDIO vsock-connect:" << guest_cid << ":22' user@" << vmname << "` to login to the VM." << std::endl;
     return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid);
 }
 
@@ -1902,6 +1914,11 @@ static int _main(int argc, char* argv[])
     program.add_subparser(usb_command);
     usb_command.add_argument("-q", "--query").help("XPath query to test finding USB devices");
 
+    argparse::ArgumentParser cid_command("cid");
+    cid_command.add_description("Get CID from VM name");
+    cid_command.add_argument("vmname").nargs(1);
+    program.add_subparser(cid_command);
+
     try {
         program.parse_args(argc, argv);
     }
@@ -1927,6 +1944,8 @@ static int _main(int argc, char* argv[])
             std::cerr << expand_command;
         } else if (program.is_subcommand_used("usb")) {
             std::cerr << usb_command;
+        } else if (program.is_subcommand_used("cid")) {
+            std::cerr << cid_command;
         } else {
             std::cerr << program;
         }
@@ -2128,6 +2147,13 @@ static int _main(int argc, char* argv[])
         //else
         print_usb_devices_xml();
         print_example_query();
+        return 0;
+    }
+
+    if (program.is_subcommand_used("cid")) {
+        auto vmname = cid_command.get("vmname");
+        auto cid = vsock::determine_guest_cid(vmname);
+        std::cout << cid << std::endl;
         return 0;
     }
 
