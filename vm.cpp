@@ -563,6 +563,7 @@ static bool is_o_direct_supported(const std::filesystem::path& file)
 struct RunOptions {
     const std::optional<std::string>& name = std::nullopt;
     const std::optional<std::filesystem::path>& virtiofs_path = std::nullopt;
+    const std::optional<std::filesystem::path>& p9_path = std::nullopt;
     const uint32_t memory = default_memory_size;
     const uint16_t cpus = 1;
     const std::optional<bool> kvm = std::nullopt;
@@ -1105,6 +1106,13 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
     
     if (options.no_shutdown) {
         qemu_cmdline.push_back("-no-shutdown");
+    }
+
+    // 9p filesystem
+    if (options.p9_path) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-virtfs", "local,path=" + options.p9_path->string() + ",mount_tag=fs,security_model=none,writeout=immediate"
+        });
     }
 
     return guest_cid;
@@ -1899,6 +1907,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--logging-items").nargs(1).help("Logging items to pass to QEMU");
     run_command.add_argument("--trace").nargs(1).help("Tracing options for QEMU");
     run_command.add_argument("--logfile").nargs(1).help("Log file to output instead of stderr");
+    run_command.add_argument("--9p").nargs(1).help("Directory to share with guest via 9pfs");
     program.add_subparser(run_command);
 
     argparse::ArgumentParser service_command("service");
@@ -1997,7 +2006,8 @@ static int _main(int argc, char* argv[])
         if (volatile_data && data_file.has_value()) {
             throw std::runtime_error("--volatile-data and --data-file(-d) are exclusive.");
         }
-        auto virtiofs_path = run_command.present("--virtiofs-path");
+        auto virtiofs_path = run_command.present<std::string>("--virtiofs-path");
+        auto p9_path = run_command.present<std::string>("--9p");
         if (!std::filesystem::exists(system_file)) throw std::runtime_error(system_file + " does not exist.");
 
         std::vector<std::tuple<netif::type::Some,std::optional<std::string>,bool>> net;
@@ -2032,6 +2042,7 @@ static int _main(int argc, char* argv[])
             return run_bios({
                     .name = run_command.present("-n"),
                     .virtiofs_path = run_command.present("--virtiofs-path"),
+                    .p9_path = p9_path,
                     .memory = run_command.get<uint32_t>("-m"),
                     .cpus = run_command.get<uint16_t>("-c"),
                     .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
@@ -2060,6 +2071,7 @@ static int _main(int argc, char* argv[])
         return run(system_file, real_data_file, std::nullopt, {
                 .name = run_command.present("-n"),
                 .virtiofs_path = run_command.present("--virtiofs-path"),
+                .p9_path = p9_path,
                 .memory = run_command.get<uint32_t>("-m"),
                 .cpus = run_command.get<uint16_t>("-c"),
                 .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
