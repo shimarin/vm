@@ -902,7 +902,7 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
                     return "pipewire";
                 }
                 if (std::filesystem::exists(xdg_runtime_dir / "pulse" / "native")) {
-                    return "pulseaudio";
+                    return "pa";
                 }
             }
 
