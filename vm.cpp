@@ -882,7 +882,7 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
     });
 
     // display
-    if (options.spice || options.vnc) {
+    if (options.spice || options.vnc || options.display) {
         std::string graphics_device = [](const auto& accel) -> std::string {
             if (accel == RunOptions::accel_t::_2d) return "virtio-gpu";
             if (accel == RunOptions::accel_t::qxl) return "qxl,vgamem_mb=128";
@@ -891,26 +891,54 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
             if (accel == RunOptions::accel_t::vulkan) device += ",venus=true";
             return device;
         }(options.accel);
+
+        std::string audio_device = [&options]() -> std::string {
+            if (options.spice) return "spice";
+            //else
+            const auto XDG_RUNTIME_DIR = getenv("XDG_RUNTIME_DIR");
+            if (XDG_RUNTIME_DIR) {
+                std::filesystem::path xdg_runtime_dir(XDG_RUNTIME_DIR);
+                if (std::filesystem::exists(xdg_runtime_dir / "pipewire-0")) {
+                    return "pipewire";
+                }
+                if (std::filesystem::exists(xdg_runtime_dir / "pulse" / "native")) {
+                    return "pulseaudio";
+                }
+            }
+
+            if (std::filesystem::exists("/dev/snd/controlC0")) {
+                return "alsa";
+            }
+            return "none";
+        }();
+
+        std::string display = [](const auto& display, const auto& accel, const auto& rendernode) -> std::string {
+            if (!display) return "egl-headless" + (rendernode? ",rendernode=" + *rendernode : "");
+            //else
+            if (accel == RunOptions::accel_t::_2d || accel == RunOptions::accel_t::qxl) {
+                return *display;
+            }
+            //else
+            return *display + ",gl=on";
+        }(options.display, options.accel, options.rendernode);
+
         if (options.gpu_max_outputs > 1) {
             graphics_device += ",max_outputs=" + std::to_string(options.gpu_max_outputs);
         }
         qemu_cmdline.insert(qemu_cmdline.end(), {
-            "-display", options.display.value_or("egl-headless" + (options.rendernode? ",rendernode=" + *options.rendernode : "")),
+            "-display", display,
             "-device", graphics_device,
             "-chardev", "spicevmc,id=vdagent,name=vdagent",
             "-device", "virtio-serial-pci", "-device", "virtserialport,chardev=vdagent,name=com.redhat.spice.0",
-            "-audiodev", "spice,id=snd0",
+            "-audiodev", audio_device + ",id=snd0",
             "-device", "virtio-sound-pci,audiodev=snd0"
         });
         if (options.spice) {
-            qemu_cmdline.insert(qemu_cmdline.end(), {"-spice", *options.spice});
+            qemu_cmdline.insert(qemu_cmdline.end(), { "-spice", *options.spice });
         }
         if (options.vnc) {
             qemu_cmdline.insert(qemu_cmdline.end(), {"-vnc", *options.vnc});
         }
-    } else if (options.display) {
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-display", *options.display});
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-vga", "virtio"});
     } else {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-display", "none"});
     }
