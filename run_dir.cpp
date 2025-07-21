@@ -2,26 +2,33 @@
 #include <unistd.h>
 
 #include <optional>
+#include <mutex>
 
 #include "run_dir.h"
 
 namespace run_dir {
 
+const std::filesystem::path& xdg_runtime_dir()
+{
+    static std::filesystem::path xdg_runtime_dir;
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        xdg_runtime_dir = [](const char* env_var) -> std::filesystem::path {
+            return env_var? std::filesystem::path(env_var) : std::filesystem::path("/run/user") / std::to_string(getuid());
+        }(getenv("XDG_RUNTIME_DIR"));
+    });
+    return xdg_runtime_dir;
+}
+
 const std::filesystem::path& root()
 {
-    static std::optional<std::filesystem::path> _run_dir = std::nullopt;
-    if (!_run_dir.has_value()) {
-        if (getuid() != 0) {
-            const auto xdg_runtime_dir = getenv("XDG_RUNTIME_DIR");
-             if (xdg_runtime_dir) _run_dir = (std::filesystem::path(xdg_runtime_dir) / "vm");
-        }
-        if (!_run_dir.has_value()) _run_dir = "/run/vm";
-
-        if (!std::filesystem::exists(*_run_dir)) {
-            std::filesystem::create_directory(*_run_dir);
-        }
-    }
-    return _run_dir.value();
+    static std::filesystem::path run_dir;
+    static std::once_flag flag;
+    std::call_once(flag, []() {
+        run_dir = getuid() == 0? "/run/vm" : xdg_runtime_dir() / "vm";
+        std::filesystem::create_directories(run_dir);
+    });
+    return run_dir;
 }
 
 int lock_pci(const std::string& pci_id)

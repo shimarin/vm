@@ -895,17 +895,12 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
         std::string audio_device = [&options]() -> std::string {
             if (options.spice) return "spice";
             //else
-            const auto XDG_RUNTIME_DIR = getenv("XDG_RUNTIME_DIR");
-            if (XDG_RUNTIME_DIR) {
-                std::filesystem::path xdg_runtime_dir(XDG_RUNTIME_DIR);
-                if (std::filesystem::exists(xdg_runtime_dir / "pipewire-0")) {
-                    return "pipewire";
-                }
-                if (std::filesystem::exists(xdg_runtime_dir / "pulse" / "native")) {
-                    return "pa";
-                }
+            if (std::filesystem::exists(run_dir::xdg_runtime_dir() / "pipewire-0")) {
+                return "pipewire";
             }
-
+            if (std::filesystem::exists(run_dir::xdg_runtime_dir() / "pulse" / "native")) {
+                return "pa";
+            }
             if (std::filesystem::exists("/dev/snd/controlC0")) {
                 return "alsa";
             }

@@ -2,6 +2,7 @@
 #include <functional>
 
 namespace run_dir {
+    const std::filesystem::path& xdg_runtime_dir();
     const std::filesystem::path& root();
 
     inline auto pci_lock() {return root() / ".pci-lock";}
