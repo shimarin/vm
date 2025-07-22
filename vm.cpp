@@ -588,6 +588,7 @@ struct RunOptions {
     const accel_t accel = accel_t::_2d;
     const uint16_t gpu_max_outputs = 1;
     const std::optional<std::string>& rendernode = std::nullopt;
+    const std::optional<std::pair<uint16_t,uint16_t>>& resolution = std::nullopt;
     const bool hvc = false;
     const bool stdio_console = false;
     const bool no_shutdown = false;
@@ -883,17 +884,21 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
 
     // display
     if (options.spice || options.vnc || options.display) {
-        std::string graphics_device = [](const auto& accel) -> std::string {
+        std::string graphics_device = [](const auto& accel, const auto& resolution) -> std::string {
             if (accel == RunOptions::accel_t::_2d) return "virtio-gpu";
             if (accel == RunOptions::accel_t::qxl) return "qxl,vgamem_mb=128";
             //else
             std::string device("virtio-gpu-gl,iommu_platform=on,hostmem=2G,blob=true");
             if (accel == RunOptions::accel_t::vulkan) device += ",venus=true";
+            if (resolution) {
+                device += ",xres=" + std::to_string(resolution->first);
+                device += ",yres=" + std::to_string(resolution->second);
+            }
             return device;
-        }(options.accel);
+        }(options.accel, options.resolution);
 
-        std::string audio_device = [&options]() -> std::string {
-            if (options.spice) return "spice";
+        std::string audio_device = [](const auto& spice) -> std::string {
+            if (spice) return "spice";
             //else
             if (std::filesystem::exists(run_dir::xdg_runtime_dir() / "pipewire-0")) {
                 return "pipewire";
@@ -905,7 +910,7 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
                 return "alsa";
             }
             return "none";
-        }();
+        }(options.spice);
 
         std::string display = [](const auto& display, const auto& accel, const auto& rendernode) -> std::string {
             if (!display) return "egl-headless" + (rendernode? ",rendernode=" + *rendernode : "");
@@ -1365,6 +1370,16 @@ static std::string escape_comma_for_qemu(const std::string& str)
     return ret;
 }
 
+static std::pair<uint16_t, uint16_t> parse_resolution(const std::string& resolution)
+{
+    auto pos = resolution.find('x');
+    if (pos == std::string::npos) throw std::runtime_error("Invalid resolution format");
+    //else
+    uint16_t width = std::stoi(resolution.substr(0, pos));
+    uint16_t height = std::stoi(resolution.substr(pos + 1));
+    return {width, height};
+}
+
 static int service(const std::string& vmname, const std::filesystem::path& vm_dir, 
     std::optional<const std::string> default_net)
 {
@@ -1470,6 +1485,9 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     auto accel = RunOptions::to_accel(iniparser_getstring(ini.get(), ":accel", "2d"));
     auto gpu_max_outputs = (uint16_t)iniparser_getint(ini.get(), ":gpu_max_outputs", 1);
     auto rendernode = iniparser_getstring(ini.get(), ":rendernode", NULL);
+    auto resolution = [](const char* resolution_string) {
+        return resolution_string? std::make_optional(parse_resolution(resolution_string)) : std::nullopt;
+    }(iniparser_getstring(ini.get(), ":resolution", NULL));
 
     std::vector<std::pair<std::filesystem::path,bool>> disks;
     for (int i = 0; i < 10; i++) {
@@ -1547,6 +1565,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .accel = accel,
                 .gpu_max_outputs = gpu_max_outputs,
                 .rendernode = rendernode? std::make_optional(rendernode) : std::nullopt,
+                .resolution = resolution,
                 .stdio_console = false,
                 .firmware_strings = firmware_strings,
                 .firmware_files = firmware_files,
@@ -1572,6 +1591,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .accel = accel,
                 .gpu_max_outputs = gpu_max_outputs,
                 .rendernode = rendernode? std::make_optional(rendernode) : std::nullopt,
+                .resolution = resolution,
                 .stdio_console = false,
                 .firmware_strings = firmware_strings,
                 .firmware_files = firmware_files,
@@ -1921,6 +1941,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--accel").help("Graphics acceraration(2d|opengl|vulkan)").default_value(RunOptions::accel_t::_2d).action(RunOptions::to_accel);
     run_command.add_argument("--gpu-max-outputs").nargs(1).scan<'u',uint16_t>().default_value<uint16_t>(1);
     run_command.add_argument("--rendernode").nargs(1).help("DRM render node to pass to QEMU");
+    run_command.add_argument("--resolution").nargs(1).help("Resolution for the Virtual display (e.g. 1920x1080)");
     run_command.add_argument("--hvc").default_value(false).implicit_value(true);
     run_command.add_argument("--pci").nargs(1);
     run_command.add_argument("--usb").nargs(1).help("XPath query to specify USB devices to passthrough");
@@ -2058,6 +2079,11 @@ static int _main(int argc, char* argv[])
             firmware_files["application.ini"] = application_ini.value();
         }
 
+        auto resolution = [](const auto& resolution_string) {
+            return resolution_string?
+                std::make_optional(parse_resolution(*resolution_string)) : std::nullopt;
+        }(run_command.present("--resolution"));
+
         if (run_command.get<bool>("--bios")) {
             auto virtio = !run_command.get<bool>("--no-virtio-for-bios-disks");
             std::vector<std::pair<std::filesystem::path,bool>> disks = {{system_file, virtio}};
@@ -2081,6 +2107,7 @@ static int _main(int argc, char* argv[])
                     .accel = run_command.get<RunOptions::accel_t>("--accel"),
                     .gpu_max_outputs = run_command.get<uint16_t>("--gpu-max-outputs"),
                     .rendernode = run_command.present("--rendernode"),
+                    .resolution = resolution,
                     .hvc = run_command.get<bool>("--hvc"),
                     .stdio_console = true,
                     .no_shutdown = run_command.get<bool>("--no-shutdown"),
@@ -2110,6 +2137,7 @@ static int _main(int argc, char* argv[])
                 .accel = run_command.get<RunOptions::accel_t>("--accel"),
                 .gpu_max_outputs = run_command.get<uint16_t>("--gpu-max-outputs"),
                 .rendernode = run_command.present("--rendernode"),
+                .resolution = resolution,
                 .hvc = run_command.get<bool>("--hvc"),
                 .stdio_console = true,
                 .no_shutdown = run_command.get<bool>("--no-shutdown"),
