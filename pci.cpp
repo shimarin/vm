@@ -37,6 +37,52 @@ static void modprobe_vfio_pci()
 
 namespace pci {
 
+/**
+ * parse PCI string
+ * format: <pci_id>,multifunction,vga.romfile=<rom_file>
+ */
+std::tuple<std::string, bool, bool, std::optional<std::string>> parse_pci_string(const std::string& pci_id)
+{
+    std::string id;
+    bool multifunction = false;
+    bool vga = false;
+    std::optional<std::string> rom_file;
+
+    size_t pos = 0;
+    size_t next_pos = pci_id.find(',');
+    if (next_pos == std::string::npos) {
+        id = pci_id;
+    } else {
+        id = pci_id.substr(pos, next_pos - pos);
+        pos = next_pos + 1;
+    }
+
+    while ((next_pos = pci_id.find(',', pos)) != std::string::npos) {
+        auto token = pci_id.substr(pos, next_pos - pos);
+        if (token == "multifunction") {
+            multifunction = true;
+        } else if (token == "vga") {
+            vga = true;
+        } else if (token.starts_with("romfile=")) {
+            rom_file = token.substr(8);
+        }
+        pos = next_pos + 1;
+    }
+    // last token
+    if (pos < pci_id.size()) {
+        auto token = pci_id.substr(pos);
+        if (token == "multifunction") {
+            multifunction = true;
+        } else if (token == "vga") {
+            vga = true;
+        } else if (token.starts_with("romfile=")) {
+            rom_file = token.substr(8);
+        }
+    }
+
+    return {id, multifunction, vga, rom_file};
+}
+
 bool replace_driver_with_vfio(const std::string& pci_id)
 {
     auto driver_dir = pci_devices_dir / pci_id / "driver";

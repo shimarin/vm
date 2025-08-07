@@ -571,7 +571,7 @@ struct RunOptions {
     const std::vector<std::string> hostfwd = {};
     const std::vector<std::filesystem::path>& usb = {};
     const std::vector<std::pair<std::filesystem::path,bool/*virtio*/>>& disks = {};
-    const std::vector<std::string>& pci = {};
+    const std::vector<std::tuple<std::string,bool,bool,std::optional<std::string>>>& pci = {};
     const std::optional<std::filesystem::path>& cdrom = std::nullopt;
     const std::optional<std::string>& append = std::nullopt;
     const std::optional<std::string>& display = std::nullopt;
@@ -966,7 +966,7 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
             + (!bios && is_o_direct_supported(disk)? ",aio=native,cache.direct=on":"") });
     }
     // Passthrough PCI devices
-    std::vector<std::string> vfio_pci_devices;
+    std::vector<std::tuple<std::string,bool,bool, std::optional<std::string>>> vfio_pci_devices;
     // find SR-IOV VFs from network interfaces and make them available to the VM through vfio-pci
     for (const auto& [net,macaddr,vhost]:options.net) {
         // macaddr and vhost are not used here
@@ -982,7 +982,7 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
             if (lock < 0) continue;
             //else
             os_resources.pci_locks.push_back(lock);
-            vfio_pci_devices.push_back(*pci_id);
+            vfio_pci_devices.push_back({*pci_id, false, false, std::nullopt});
             break;
         }
         if (lock < 0) {
@@ -991,9 +991,19 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
     }
     vfio_pci_devices.insert(vfio_pci_devices.end(), options.pci.begin(), options.pci.end());
     for (const auto& pci : vfio_pci_devices) {
-        pci::replace_driver_with_vfio(pci);
+        pci::replace_driver_with_vfio(std::get<0>(pci));
         qemu_cmdline.push_back("-device");
-        qemu_cmdline.push_back("vfio-pci,host=" + pci);
+        std::string device_str = "vfio-pci,host=" + std::get<0>(pci);
+        if (std::get<1>(pci)) {
+            device_str += ",multifunction=on";
+        }
+        if (std::get<2>(pci)) {
+            device_str += ",x-vga=on";
+        }
+        if (std::get<3>(pci)) {
+            device_str += ",romfile=" + *std::get<3>(pci);
+        }
+        qemu_cmdline.push_back(device_str);
     }
     // Network interfaces
     int net_num = 0;
@@ -1139,7 +1149,7 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
     // 9p filesystem
     if (options.p9_path) {
         qemu_cmdline.insert(qemu_cmdline.end(), {
-            "-virtfs", "local,path=" + options.p9_path->string() + ",mount_tag=fs,security_model=none,writeout=immediate"
+            "-virtfs", "local,path=" + options.p9_path->string() + ",mount_tag=fs,security_model=mapped-xattr,writeout=immediate"
         });
     }
 
@@ -1267,6 +1277,10 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
 
     if (initramfs.has_value()) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-initrd", initramfs.value()});
+    }
+
+    if (std::filesystem::exists("/usr/share/edk2-ovmf/OVMF_CODE.fd")) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {"-bios", "/usr/share/edk2-ovmf/OVMF_CODE.fd"});
     }
 
     apply_common_args_to_qemu_cmdline(vmname, qemu_cmdline);
@@ -1500,7 +1514,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     }
    
     // PCI passthrough
-    std::vector<std::string> pci;
+    std::vector<std::tuple<std::string,bool,bool,std::optional<std::string>>> pci;
     for (int i = 0; i < 10; i++) {
         char buf[16];
         sprintf(buf, "pci%d", i);
@@ -1508,8 +1522,18 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
         sprintf(buf, "pci%d:id", i);
         auto pci_id = iniparser_getstring(ini.get(), buf, NULL);
         if (!pci_id) throw std::runtime_error("id is not specified for pci" + std::to_string(i));
+
+        sprintf(buf, "pci%d:multifunction", i);
+        bool multifunction = iniparser_getboolean(ini.get(), buf, false);
+
+        sprintf(buf, "pci%d:vga", i);
+        bool vga = iniparser_getboolean(ini.get(), buf, false);
+
+        sprintf(buf, "pci%d:romfile", i);
+        auto pci_rom = iniparser_getstring(ini.get(), buf, NULL);
+       
         //else
-        pci.push_back(pci_id);
+        pci.push_back({pci_id, multifunction, vga, pci_rom? std::make_optional(std::string(pci_rom)) : std::nullopt});
     }
 
     auto cdrom = 
@@ -2072,7 +2096,10 @@ static int _main(int argc, char* argv[])
                     std::make_optional(volatile_data? create_temporary_data_file() : std::filesystem::path(data_file.value()))
                     : std::nullopt;
         
-        auto pci = run_command.get<std::vector<std::string>>("--pci");
+        std::vector<std::tuple<std::string,bool,bool, std::optional<std::string>>> pci;
+        for (const auto& pci_str : run_command.get<std::vector<std::string>>("--pci")) {
+            pci.push_back(pci::parse_pci_string(pci_str));
+        }
         auto application_ini = run_command.present("--application-ini");
         std::map<std::string,std::filesystem::path> firmware_files;
         if (application_ini.has_value()) {
