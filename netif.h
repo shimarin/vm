@@ -21,8 +21,12 @@ namespace netif {
             std::string pf_name;
             int vf_start, vf_count;
         };
+        struct VDE {
+            VDE(const std::filesystem::path& _sock_dir) : sock_dir(_sock_dir) {}
+            std::filesystem::path sock_dir;
+        };
 
-        typedef std::variant<User,Bridge,Tap,Mcast,MACVTAP,SRIOV> Some;
+        typedef std::variant<User,Bridge,Tap,Mcast,MACVTAP,SRIOV,VDE> Some;
     }
 
     type::Some to_netif(const std::string& ifname);

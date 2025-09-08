@@ -56,6 +56,11 @@ static bool is_macvtap(const std::string& ifname)
     return std::filesystem::is_directory(sysfs / ifname / "macvtap");
 }
 
+static bool is_vde(const std::string& ifname)
+{
+    return std::filesystem::is_socket(std::filesystem::path(ifname) / "ctl");
+}
+
 std::optional<std::string> get_vf_pci_id(const std::string& pf_name, int vf_number)
 {
     auto vf_dir = sysfs / pf_name / "device" / ("virtfn" + std::to_string(vf_number));
@@ -105,6 +110,8 @@ type::Some to_netif(const std::string& ifname)
         return type::Mcast(ifname);
     } else if (is_macvtap(ifname)) {
         return type::MACVTAP(ifname);
+    } else if (is_vde(ifname)) {
+        return type::VDE(std::filesystem::path(ifname));
     }
     //else
     auto sriov_pd_and_vf_range = get_pf_and_vf_range(ifname);

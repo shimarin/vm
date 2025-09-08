@@ -1045,6 +1045,8 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
                 _macaddr = macaddr;
                 os_resources.fds.insert(fd);
                 return "tap,id=" + net_id + ",fd=" + std::to_string(fd) + (vhost? ",vhost=on" : "");
+            } else if (std::holds_alternative<netif::type::VDE>(net)) {
+                return "vde,id=" + net_id + ",sock=" + std::get<netif::type::VDE>(net).sock_dir.string();
             } else
                 throw std::runtime_error("Invalid network type");
         }();
