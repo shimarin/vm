@@ -122,7 +122,13 @@ namespace vsock {
 
     int ssh(uid_t uid, const std::string& vmname, const std::vector<std::string>& ssh_args) {
         uint32_t guest_cid = determine_guest_cid(uid, vmname);
-        std::vector<std::string> cmd = {"ssh", "-o", "ProxyCommand=socat STDIO vsock-connect:" + std::to_string(guest_cid) + ":22"};
+        std::vector<std::string> cmd = {
+            "ssh", 
+            "-o", "ProxyCommand=socat STDIO vsock-connect:" + std::to_string(guest_cid) + ":22",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "LogLevel=ERROR",
+        };
         cmd.insert(cmd.end(), ssh_args.begin(), ssh_args.end());
         // Convert to char* array for execvp
         std::vector<char*> argv;
