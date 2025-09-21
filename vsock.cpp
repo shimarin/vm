@@ -109,17 +109,31 @@ public:
 };
 
 namespace vsock {
-    uint32_t determine_guest_cid(const std::string& vmname) {
+    uint32_t determine_guest_cid(uid_t uid, const std::string& vmname) {
         if (vmname.empty()) {
             throw std::invalid_argument("VM name cannot be empty");
         }
-        if (vmname.length() > 64) {
-            throw std::invalid_argument("VM name is too long (max 64 characters)");
-        }
-        auto hash = SHA256::hash(vmname);
+        auto hash = SHA256::hash(std::to_string(uid) + ":" + vmname);
         // 最初の4バイトをuint32_tに変換
         uint32_t hash_value = (hash[0] << 24) | (hash[1] << 16) | (hash[2] << 8) | hash[3];
         // CID範囲（3〜4294967295）にマッピング
         return (hash_value % 4294967293) + 3;
+    }
+
+    int ssh(uid_t uid, const std::string& vmname, const std::vector<std::string>& ssh_args) {
+        uint32_t guest_cid = determine_guest_cid(uid, vmname);
+        std::vector<std::string> cmd = {"ssh", "-o", "ProxyCommand=socat STDIO vsock-connect:" + std::to_string(guest_cid) + ":22"};
+        cmd.insert(cmd.end(), ssh_args.begin(), ssh_args.end());
+        // Convert to char* array for execvp
+        std::vector<char*> argv;
+        for (const auto& arg : cmd) {
+            argv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv.push_back(nullptr);
+
+        execvp("ssh", argv.data());
+        // If execvp returns, an error occurred
+        perror("execvp failed");
+        return -1;
     }
 }

@@ -1071,7 +1071,7 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
     }
 
     // vsock
-    uint32_t guest_cid = vsock::determine_guest_cid(vmname);
+    uint32_t guest_cid = vsock::determine_guest_cid(getuid(), vmname);
     qemu_cmdline.insert(qemu_cmdline.end(), {
         "-device", "vhost-vsock-pci,guest-cid=" + std::to_string(guest_cid)
     });
@@ -2032,6 +2032,12 @@ static int _main(int argc, char* argv[])
     cid_command.add_argument("vmname").nargs(1);
     program.add_subparser(cid_command);
 
+    argparse::ArgumentParser ssh_command("ssh");
+    ssh_command.add_description("SSH to VM");
+    // capture all other arguments and pass to ssh
+    ssh_command.add_argument("ssh_args").nargs(argparse::nargs_pattern::any);
+    program.add_subparser(ssh_command);
+
     try {
         program.parse_args(argc, argv);
     }
@@ -2059,6 +2065,8 @@ static int _main(int argc, char* argv[])
             std::cerr << usb_command;
         } else if (program.is_subcommand_used("cid")) {
             std::cerr << cid_command;
+        } else if (program.is_subcommand_used("ssh")) {
+            std::cerr << ssh_command;
         } else {
             std::cerr << program;
         }
@@ -2278,9 +2286,25 @@ static int _main(int argc, char* argv[])
 
     if (program.is_subcommand_used("cid")) {
         auto vmname = cid_command.get("vmname");
-        auto cid = vsock::determine_guest_cid(vmname);
+        auto cid = vsock::determine_guest_cid(getuid(), vmname);
         std::cout << cid << std::endl;
         return 0;
+    }
+
+    if (program.is_subcommand_used("ssh")) {
+        auto ssh_args = ssh_command.get<std::vector<std::string>>("ssh_args");
+        // determine vmname from ssh_args[-1]
+        if (ssh_args.size() == 0) {
+            std::cerr << "username@vmname is required." << std::endl;
+            return 1;
+        }
+        auto user_at_vmname = ssh_args.back();
+        if (user_at_vmname.find('@') == std::string::npos) {
+            std::cerr << "username@vmname is required." << std::endl;
+            return 1;
+        }
+        auto vmname = user_at_vmname.substr(user_at_vmname.find('@') + 1);
+        return vsock::ssh(getuid(), vmname, ssh_args); // never returns if success
     }
 
     std::cout << program;
