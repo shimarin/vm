@@ -142,4 +142,27 @@ namespace vsock {
         perror("execvp failed");
         return -1;
     }
+
+    int scp(uid_t uid, const std::string& vmname, const std::vector<std::string>& scp_args) {
+        uint32_t guest_cid = determine_guest_cid(uid, vmname);
+        std::vector<std::string> cmd = {
+            "scp", 
+            "-o", "ProxyCommand=socat STDIO vsock-connect:" + std::to_string(guest_cid) + ":22",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "LogLevel=ERROR",
+        };
+        cmd.insert(cmd.end(), scp_args.begin(), scp_args.end());
+        // Convert to char* array for execvp
+        std::vector<char*> argv;
+        for (const auto& arg : cmd) {
+            argv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv.push_back(nullptr);
+
+        execvp("scp", argv.data());
+        // If execvp returns, an error occurred
+        perror("execvp failed");
+        return -1;
+    }
 }
