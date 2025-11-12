@@ -1169,6 +1169,14 @@ static void apply_virtiofs_to_qemu_cmdline(const std::string& vmname, std::vecto
 static int run_qemu(const std::string& vmname, const std::vector<std::string>& cmdline, 
     const std::map<std::string,std::string>& qemu_env, pid_t virtiofsd_pid = -1)
 {
+    // create QGA lock file if not exists
+    auto qga_lock_fd = open(run_dir::qga_lock(vmname).c_str(), O_CREAT|O_RDWR, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
+    if (qga_lock_fd >= 0) {
+        close(qga_lock_fd);
+    } else if (errno != EEXIST) {
+        std::cerr << "Warning: Failed to create QGA lock file: " << strerror(errno) << std::endl;
+    }
+
     auto qemu_pid = fork();
     if (qemu_pid < 0) throw std::runtime_error("fork() failed");
     if (qemu_pid == 0) { // child process
@@ -1794,6 +1802,7 @@ static int show(std::optional<std::string> vmname)
         }
         obj["qemu-pid"] = run_dir::qemu_pid(vmname);
         obj["qga"] = run_dir::qga_sock(vmname);
+        obj["qga_lock"] = run_dir::qga_lock(vmname);
     };
 
     if (vmname.has_value()) {
