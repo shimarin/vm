@@ -863,7 +863,7 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
 
     // machine
     auto machine_type = [&arch,bios]() {
-        if (arch == "x86_64") return bios? "q35" : "pc";
+        if (arch == "x86_64") return "q35";
         //else 
         if (bios) throw std::runtime_error("BIOS is only supported on x86_64");
         //else
