@@ -598,6 +598,7 @@ struct RunOptions {
     const std::optional<uint64_t> virtiofs_rlimit_nofile = {};
     const std::optional<std::string> virtiofs_cache = {};
     const std::optional<std::string> virtiofs_inode_file_handles = {};
+    const bool qga = true;
     const std::optional<std::string>& logging_items = std::nullopt;
     const std::optional<std::string>& trace = std::nullopt;
     const std::optional<std::filesystem::path>& logfile = std::nullopt;
@@ -766,8 +767,6 @@ static void apply_common_args_to_qemu_cmdline(const std::string& vmname, std::ve
         "-nodefaults", "-device", "usb-ehci", "-device", "usb-kbd", "-device", "usb-tablet", "-rtc", "base=utc",
         "-monitor", "unix:" + run_dir::monitor_sock(vmname).string() + ",server,nowait",
         "-qmp", "unix:" + run_dir::qmp_sock(vmname).string() + ",server,nowait",
-        "-chardev", "socket,path=" + run_dir::qga_sock(vmname).string() + ",server=on,wait=off,id=qga0",
-        "-device", "virtio-serial", "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
         "-fw_cfg", "opt/vmname,string=" + vmname,
         "-pidfile", run_dir::qemu_pid(vmname)
     });
@@ -1152,6 +1151,14 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
     if (options.p9_path) {
         qemu_cmdline.insert(qemu_cmdline.end(), {
             "-virtfs", "local,path=" + options.p9_path->string() + ",mount_tag=fs,security_model=mapped-xattr,writeout=immediate"
+        });
+    }
+
+    // qga (guest agent)
+    if (options.qga) {
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-chardev", "socket,path=" + run_dir::qga_sock(vmname).string() + ",server=on,wait=off,id=qga0",
+            "-device", "virtio-serial", "-device", "virtserialport,chardev=qga0,name=org.qemu.guest_agent.0",
         });
     }
 
@@ -1581,6 +1588,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     const char* virtiofs_cache = iniparser_getstring(ini.get(), "virtiofs:cache", NULL);
     const char* virtiofs_inode_file_handles = iniparser_getstring(ini.get(), "virtiofs:inode-file-handles", NULL);
 
+    bool qga = iniparser_getboolean(ini.get(), ":qga", 1);
+
     if (type == "genpack") {
         return run(system_file, data_file, swap_file, {
                 .name = vmname,
@@ -1606,7 +1615,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .qemu_env = qemu_env,
                 .virtiofs_rlimit_nofile = rlimit_nofile > 0? std::optional(rlimit_nofile) : std::nullopt,
                 .virtiofs_cache = virtiofs_cache? std::make_optional(std::string(virtiofs_cache)) : std::nullopt,
-                .virtiofs_inode_file_handles = virtiofs_inode_file_handles? std::make_optional(std::string(virtiofs_inode_file_handles)) : std::nullopt
+                .virtiofs_inode_file_handles = virtiofs_inode_file_handles? std::make_optional(std::string(virtiofs_inode_file_handles)) : std::nullopt,
+                .qga = qga
             } );
     } else if (type == "bios") {
         return run_bios({
@@ -1632,7 +1642,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .qemu_env = qemu_env,
                 .virtiofs_rlimit_nofile = rlimit_nofile > 0? std::optional(rlimit_nofile) : std::nullopt,
                 .virtiofs_cache = virtiofs_cache? std::make_optional(std::string(virtiofs_cache)) : std::nullopt,
-                .virtiofs_inode_file_handles = virtiofs_inode_file_handles? std::make_optional(std::string(virtiofs_inode_file_handles)) : std::nullopt
+                .virtiofs_inode_file_handles = virtiofs_inode_file_handles? std::make_optional(std::string(virtiofs_inode_file_handles)) : std::nullopt,
+                .qga = qga
             } );
     } else {
         throw std::runtime_error("Unknown VM type '" + type + "'.");
@@ -1801,8 +1812,10 @@ static int show(std::optional<std::string> vmname)
             obj["console"] = run_dir::console_sock(vmname);
         }
         obj["qemu-pid"] = run_dir::qemu_pid(vmname);
-        obj["qga"] = run_dir::qga_sock(vmname);
-        obj["qga_lock"] = run_dir::qga_lock(vmname);
+        if (std::filesystem::is_socket(run_dir::qga_sock(vmname))) {
+            obj["qga"] = run_dir::qga_sock(vmname);
+            obj["qga_lock"] = run_dir::qga_lock(vmname);
+        }
     };
 
     if (vmname.has_value()) {
