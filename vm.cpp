@@ -765,6 +765,8 @@ static void apply_common_args_to_qemu_cmdline(const std::string& vmname, std::ve
 {
     qemu_cmdline.insert(qemu_cmdline.end(), {
         "-nodefaults", "-device", "usb-ehci", "-device", "usb-kbd", "-device", "usb-tablet", "-rtc", "base=utc",
+        "-object", "rng-random,id=rng0,filename=/dev/urandom",
+        "-device", "virtio-rng-pci,rng=rng0",
         "-monitor", "unix:" + run_dir::monitor_sock(vmname).string() + ",server,nowait",
         "-qmp", "unix:" + run_dir::qmp_sock(vmname).string() + ",server,nowait",
         "-fw_cfg", "opt/vmname,string=" + vmname,
