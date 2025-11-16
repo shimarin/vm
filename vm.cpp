@@ -599,6 +599,7 @@ struct RunOptions {
     const std::optional<std::string> virtiofs_cache = {};
     const std::optional<std::string> virtiofs_inode_file_handles = {};
     const bool qga = true;
+    const bool uefi = true;
     const std::optional<std::string>& logging_items = std::nullopt;
     const std::optional<std::string>& trace = std::nullopt;
     const std::optional<std::filesystem::path>& logfile = std::nullopt;
@@ -1298,7 +1299,7 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
         qemu_cmdline.insert(qemu_cmdline.end(), {"-initrd", initramfs.value()});
     }
 
-    if (std::filesystem::exists("/usr/share/edk2-ovmf/OVMF_CODE.fd")) {
+    if (options.uefi && std::filesystem::exists("/usr/share/edk2-ovmf/OVMF_CODE.fd")) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-bios", "/usr/share/edk2-ovmf/OVMF_CODE.fd"});
     }
 
@@ -1591,6 +1592,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
     const char* virtiofs_inode_file_handles = iniparser_getstring(ini.get(), "virtiofs:inode-file-handles", NULL);
 
     bool qga = iniparser_getboolean(ini.get(), ":qga", 1);
+    bool uefi = iniparser_getboolean(ini.get(), ":uefi", 1);
 
     if (type == "genpack") {
         return run(system_file, data_file, swap_file, {
@@ -1618,7 +1620,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .virtiofs_rlimit_nofile = rlimit_nofile > 0? std::optional(rlimit_nofile) : std::nullopt,
                 .virtiofs_cache = virtiofs_cache? std::make_optional(std::string(virtiofs_cache)) : std::nullopt,
                 .virtiofs_inode_file_handles = virtiofs_inode_file_handles? std::make_optional(std::string(virtiofs_inode_file_handles)) : std::nullopt,
-                .qga = qga
+                .qga = qga,
+                .uefi = uefi
             } );
     } else if (type == "bios") {
         return run_bios({
@@ -1645,7 +1648,8 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .virtiofs_rlimit_nofile = rlimit_nofile > 0? std::optional(rlimit_nofile) : std::nullopt,
                 .virtiofs_cache = virtiofs_cache? std::make_optional(std::string(virtiofs_cache)) : std::nullopt,
                 .virtiofs_inode_file_handles = virtiofs_inode_file_handles? std::make_optional(std::string(virtiofs_inode_file_handles)) : std::nullopt,
-                .qga = qga
+                .qga = qga,
+                .uefi = uefi
             } );
     } else {
         throw std::runtime_error("Unknown VM type '" + type + "'.");
