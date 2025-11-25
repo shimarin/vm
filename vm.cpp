@@ -570,7 +570,7 @@ struct RunOptions {
     const std::vector<std::tuple<netif::type::Some,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
     const std::vector<std::string> hostfwd = {};
     const std::vector<std::filesystem::path>& usb = {};
-    const std::vector<std::pair<std::filesystem::path,bool/*virtio*/>>& disks = {};
+    const std::vector<std::tuple<std::filesystem::path,bool/*virtio*/,std::optional<std::string>/*serial*/>>& disks = {};
     const std::vector<std::tuple<std::string,bool,bool,std::optional<std::string>>>& pci = {};
     const std::optional<std::filesystem::path>& cdrom = std::nullopt;
     const std::optional<std::string>& append = std::nullopt;
@@ -962,10 +962,20 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
         qemu_cmdline.insert(qemu_cmdline.end(), {"-smp", "cpus=" + std::to_string(options.cpus)});
     }
     // Disks
-    for (const auto& [disk,virtio] : options.disks) {
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + disk.string() + ",format=raw,media=disk"
-            + (virtio? ",if=virtio" : "")
-            + (!bios && is_o_direct_supported(disk)? ",aio=native,cache.direct=on":"") });
+    int disk_num = 0;
+    for (const auto& [disk,virtio,serial] : options.disks) {
+        std::string disk_id = serial? *serial : "disk" + std::to_string(disk_num++);
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-drive", "file=" + disk.string() + ",format=raw,media=disk"
+            + ",id=" + disk_id
+            + (virtio? ",if=none" : "")
+            + (!bios && is_o_direct_supported(disk)? ",aio=native,cache.direct=on":"")
+        });
+        if (virtio) {
+            qemu_cmdline.insert(qemu_cmdline.end(), {
+                "-device", "virtio-blk-pci,drive=" + disk_id + (serial? ",serial=" + *serial : "")
+            });
+        }
     }
     // Passthrough PCI devices
     std::vector<std::tuple<std::string,bool,bool, std::optional<std::string>>> vfio_pci_devices;
@@ -1306,27 +1316,42 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
     apply_common_args_to_qemu_cmdline(vmname, qemu_cmdline);
 
     if (system_file) {
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + system_file->string() + ",format=raw,media=disk,if=virtio,readonly=on" 
-            + (is_o_direct_supported(*system_file)? ",aio=native,cache.direct=on":"") });
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-drive", "file=" + system_file->string() + ",format=raw,media=disk,if=none,readonly=on,id=system"
+            + (is_o_direct_supported(*system_file)? ",aio=native,cache.direct=on":""),
+            "-device", "virtio-blk-pci,drive=system,serial=system"
+        });
     } else {
         // dummy data
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("system").string() + ",format=raw,readonly=on,media=disk,if=virtio,readonly=on"});
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-drive", "file=" + create_dummy_block_file("system").string() + ",format=raw,readonly=on,media=disk,if=virtio,readonly=on"
+        });
     }
 
     if (data_file) {
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + data_file->string() + ",format=raw,media=disk,if=virtio" 
-            + (is_o_direct_supported(*data_file)? ",aio=native,cache.direct=on":"") });
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-drive", "file=" + data_file->string() + ",format=raw,media=disk,if=none,id=data" 
+            + (is_o_direct_supported(*data_file)? ",aio=native,cache.direct=on":""),
+            "-device", "virtio-blk-pci,drive=data,serial=data"
+        });
     } else {
         // dummy data
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("data").string() + ",format=raw,readonly=on,media=disk,if=virtio,readonly=on"});
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-drive", "file=" + create_dummy_block_file("data").string() + ",format=raw,readonly=on,media=disk,if=virtio,readonly=on"
+        });
     }
 
     if (swap_file) {
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + swap_file->string() + ",format=raw,media=disk,if=virtio" 
-            + (is_o_direct_supported(*swap_file)? ",aio=native,cache.direct=on":"") });
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-drive", "file=" + swap_file->string() + ",format=raw,media=disk,if=none,id=swap"
+            + (is_o_direct_supported(*swap_file)? ",aio=native,cache.direct=on":""),
+            "-device", "virtio-blk-pci,drive=swap,serial=swap"
+        });
     } else {
         // dummy swap
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-drive", "file=" + create_dummy_block_file("swapfile").string() + ",format=raw,readonly=on,media=disk,if=virtio,readonly=on"});
+        qemu_cmdline.insert(qemu_cmdline.end(), {
+            "-drive", "file=" + create_dummy_block_file("swapfile").string() + ",format=raw,readonly=on,media=disk,if=virtio,readonly=on"
+        });
     }
 
     auto guest_cid = apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, arch.value(), os_resources);
@@ -1423,14 +1448,16 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
 
     std::cout << "Starting " << vmname << " on " << vm_dir.string() << " ..." << std::endl;
 
-    auto system_file = [&vm_dir]() {
-        auto system_file_name = vm_dir / "system";
-        return std::filesystem::exists(system_file_name)? std::make_optional(system_file_name) : std::nullopt;
-    }();
-    auto data_file = std::make_optional(vm_dir / "data");
-    if (!std::filesystem::exists(data_file.value())) data_file = std::nullopt;
-    auto swap_file = std::make_optional(vm_dir / "swapfile");
-    if (!std::filesystem::exists(swap_file.value())) swap_file = std::nullopt;
+    auto none_if_not_exists = [&vm_dir](const std::filesystem::path& p) {
+        return std::filesystem::exists(vm_dir / p)? std::make_optional(vm_dir / p) : std::nullopt;
+    };
+
+    auto system_file = none_if_not_exists("system");
+    auto data_file = none_if_not_exists("data");
+    auto swap_file = none_if_not_exists("swapfile");
+
+    auto docker_file = none_if_not_exists("docker");
+    auto mysql_file = none_if_not_exists("mysql");
 
     auto virtiofs_path = vm_dir / "fs";
     std::filesystem::create_directories(virtiofs_path);
@@ -1523,14 +1550,22 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
         return resolution_string? std::make_optional(parse_resolution(resolution_string)) : std::nullopt;
     }(iniparser_getstring(ini.get(), ":resolution", NULL));
 
-    std::vector<std::pair<std::filesystem::path,bool>> disks;
+    std::vector<std::tuple<std::filesystem::path,bool,std::optional<std::string>>> disks;
+    if (docker_file) {
+        disks.push_back({*docker_file, true, std::make_optional(std::string("docker"))});
+    }
+    if (mysql_file) {
+        disks.push_back({*mysql_file, true, std::make_optional(std::string("mysql"))});
+    }   
     for (int i = 0; i < 10; i++) {
         auto disk_name = "disk" + std::to_string(i);
         auto disk = vm_dir / disk_name;
         char buf[16];
         sprintf(buf, "disk%d:virtio", i);
         auto virtio = iniparser_getboolean(ini.get(), buf, true);
-        if (std::filesystem::exists(disk)) disks.push_back({disk,virtio});
+        sprintf(buf, "disk%d:serial", i);
+        auto serial = iniparser_getstring(ini.get(), buf, NULL);
+        if (std::filesystem::exists(disk)) disks.push_back({disk,virtio, serial? std::make_optional(std::string(serial)) : std::nullopt});
     }
    
     // PCI passthrough
@@ -2159,8 +2194,8 @@ static int _main(int argc, char* argv[])
 
         if (run_command.get<bool>("--bios")) {
             auto virtio = !run_command.get<bool>("--no-virtio-for-bios-disks");
-            std::vector<std::pair<std::filesystem::path,bool>> disks = {{system_file, virtio}};
-            if (real_data_file.has_value()) disks.push_back({real_data_file.value(), virtio});
+            std::vector<std::tuple<std::filesystem::path,bool,std::optional<std::string>>> disks = {{system_file, virtio, std::nullopt}};
+            if (real_data_file.has_value()) disks.push_back({real_data_file.value(), virtio, std::nullopt});
             return run_bios({
                     .name = run_command.present("-n"),
                     .virtiofs_path = run_command.present("--virtiofs-path"),
