@@ -11,3 +11,4 @@ A tool to run genpack'ed system image as a QEMU virtual machine
 - libsmartcols-dev
 - libsystemd-dev
 - libsquashfuse-dev
+- libxml++-2.6-dev
