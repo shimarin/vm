@@ -1309,8 +1309,16 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
         qemu_cmdline.insert(qemu_cmdline.end(), {"-initrd", initramfs.value()});
     }
 
-    if (options.uefi && std::filesystem::exists("/usr/share/edk2-ovmf/OVMF_CODE.fd")) {
-        qemu_cmdline.insert(qemu_cmdline.end(), {"-bios", "/usr/share/edk2-ovmf/OVMF_CODE.fd"});
+    if (options.uefi) {
+        auto uefi_code = [](const std::string& arch) -> std::optional<std::filesystem::path> {
+            if (arch == "x86_64") 
+                return std::make_optional(std::filesystem::path("/usr/share/edk2/OvmfX64/OVMF_CODE.fd"));
+            //else
+            return std::nullopt;
+        }(*arch);
+        if (uefi_code && std::filesystem::exists(*uefi_code)) {
+            qemu_cmdline.insert(qemu_cmdline.end(), {"-bios", uefi_code->string()});
+        }
     }
 
     apply_common_args_to_qemu_cmdline(vmname, qemu_cmdline);
