@@ -924,7 +924,7 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
         }(options.spice);
 
         std::string display = [](const auto& display, const auto& accel, const auto& rendernode) -> std::string {
-            if (!display) return "egl-headless" + (rendernode? ",rendernode=" + *rendernode : "");
+            if (!display || *display == "egl-headless") return "egl-headless" + (rendernode? ",rendernode=" + *rendernode : "");
             //else
             if (accel == RunOptions::accel_t::_2d || accel == RunOptions::accel_t::qxl) {
                 return *display;
