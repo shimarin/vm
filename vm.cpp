@@ -578,6 +578,7 @@ struct RunOptions {
     const std::optional<bool> kvm = std::nullopt;
     const std::vector<std::tuple<netif::type::Some,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
     const std::vector<std::string> hostfwd = {};
+    const std::vector<std::string> guestfwd = {};
     const std::vector<std::filesystem::path>& usb = {};
     const std::vector<std::tuple<std::filesystem::path,bool/*virtio*/,std::optional<std::string>/*serial*/>>& disks = {};
     const std::vector<std::tuple<std::string,bool,bool,std::optional<std::string>>>& pci = {};
@@ -1075,11 +1076,13 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
         if (netdev.starts_with("user,")) {
             if (has_user_net) throw std::runtime_error("Only one user network interface is allowed");
             //else
-            std::string hostfwd_str;
             for (const auto& hostfwd:options.hostfwd) {
-                hostfwd_str += ",hostfwd=" + hostfwd;
+                netdev += ",hostfwd=" + hostfwd;
             }
-            netdev += hostfwd_str;
+            for (const auto& guestfwd:options.guestfwd) {
+                netdev += ",guestfwd=" + guestfwd;
+            }
+            has_user_net = true;
         }
         //const auto device = std::format("virtio-net-pci,romfile=,netdev={},mac={}", net_id, _macaddr);
         const auto device = "virtio-net-pci,romfile=,netdev=" + net_id + ",mac=" + _macaddr;
@@ -1089,6 +1092,10 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
             "-device", device
         });
         net_num++;
+    }
+
+    if (!has_user_net && (!options.hostfwd.empty() || !options.guestfwd.empty())) {
+        std::cerr << "Warning: --hostfwd/--guestfwd specified but no user network interface is present; they will be ignored." << std::endl;
     }
 
     // vsock
@@ -2038,6 +2045,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--cdrom").nargs(1);
     run_command.add_argument("-i", "--net").help("Network interface").append();
     run_command.add_argument("--hostfwd").help("pass hostfwd to QEMU").append();
+    run_command.add_argument("--guestfwd").help("pass guestfwd to QEMU").append();
     run_command.add_argument("--virtiofs-path").nargs(1);
     run_command.add_argument("--no-kvm").default_value(false).implicit_value(true);
     run_command.add_argument("--append").nargs(1);
@@ -2192,6 +2200,7 @@ static int _main(int argc, char* argv[])
         }
 
         auto hostfwd = run_command.get<std::vector<std::string>>("--hostfwd");
+        auto guestfwd = run_command.get<std::vector<std::string>>("--guestfwd");
 
         std::vector<std::filesystem::path> usb = run_command.present("--usb")?
             query_usb_devices(run_command.get<std::string>("--usb")) : std::vector<std::filesystem::path>();
@@ -2228,6 +2237,7 @@ static int _main(int argc, char* argv[])
                     .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                     .net = net,
                     .hostfwd = hostfwd,
+                    .guestfwd = guestfwd,
                     .usb = usb,
                     .disks = disks,
                     .pci = pci,
@@ -2258,6 +2268,7 @@ static int _main(int argc, char* argv[])
                 .kvm = run_command.get<bool>("--no-kvm")? std::make_optional(false) : std::nullopt,
                 .net = net,
                 .hostfwd = hostfwd,
+                .guestfwd = guestfwd,
                 .usb = usb,
                 .pci = pci,
                 .cdrom = run_command.present("--cdrom"),
