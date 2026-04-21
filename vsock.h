@@ -3,12 +3,12 @@
 
 #include <cstdint>
 #include <string>
+#include <filesystem>
 #include <unistd.h>
 
 namespace vsock {
-    // Function to determine the guest CID based on the VM name
-    // Returns the CID as a uint32_t
     uint32_t determine_guest_cid(uid_t uid, const std::string& vmname);
+    pid_t run_sock_forward(uint32_t vsock_port, const std::filesystem::path& unix_sock_path);
 } // namespace vsock
 
 #endif // __VSOCK_H__

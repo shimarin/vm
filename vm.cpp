@@ -579,6 +579,7 @@ struct RunOptions {
     const std::vector<std::tuple<netif::type::Some,std::optional<std::string>/*mac address*/,bool/*vhost*/>>& net = {};
     const std::vector<std::string> hostfwd = {};
     const std::vector<std::string> guestfwd = {};
+    const std::vector<std::filesystem::path> sock_forward = {};
     const std::vector<std::filesystem::path>& usb = {};
     const std::vector<std::tuple<std::filesystem::path,bool/*virtio*/,std::optional<std::string>/*serial*/>>& disks = {};
     const std::vector<std::tuple<std::string,bool,bool,std::optional<std::string>>>& pci = {};
@@ -814,6 +815,7 @@ struct qemu_os_resources {
     std::optional<int> vm_run_dir_lock_fd;
     std::vector<int> pci_locks;
     std::optional<pid_t> virtiofsd_pid;
+    std::vector<pid_t> sock_forward_pids;
     std::set<int> fds;
     ~qemu_os_resources() {
         for (auto fd:fds) close(fd);
@@ -822,6 +824,11 @@ struct qemu_os_resources {
             std::cout << "Shutting down virtiofsd..." << std::endl;
             kill(*virtiofsd_pid, SIGTERM);
             waitpid(*virtiofsd_pid, NULL, 0);
+        }
+
+        for (auto pid : sock_forward_pids) {
+            kill(pid, SIGTERM);
+            waitpid(pid, NULL, 0);
         }
 
         if (vm_run_dir_lock_fd.has_value() && *vm_run_dir_lock_fd >= 0) {
@@ -1202,8 +1209,9 @@ static void apply_virtiofs_to_qemu_cmdline(const std::string& vmname, std::vecto
     });
 }
 
-static int run_qemu(const std::string& vmname, const std::vector<std::string>& cmdline, 
-    const std::map<std::string,std::string>& qemu_env, pid_t virtiofsd_pid = -1)
+static int run_qemu(const std::string& vmname, const std::vector<std::string>& cmdline,
+    const std::map<std::string,std::string>& qemu_env, pid_t virtiofsd_pid = -1,
+    const std::vector<pid_t>& sock_forward_pids = {})
 {
     // create QGA lock file if not exists
     auto qga_lock_fd = open(run_dir::qga_lock(vmname).c_str(), O_CREAT|O_RDWR, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
@@ -1263,6 +1271,15 @@ static int run_qemu(const std::string& vmname, const std::vector<std::string>& c
                 if (info.ssi_pid == qemu_pid) break; // QEMU terminated
                 else if (info.ssi_pid == virtiofsd_pid) {
                     std::cout << "virtiofsd terminated!" << std::endl;
+                } else if (std::find(sock_forward_pids.begin(), sock_forward_pids.end(), (pid_t)info.ssi_pid)
+                           != sock_forward_pids.end()) {
+                    int wstatus;
+                    waitpid(info.ssi_pid, &wstatus, WNOHANG);
+                    if (WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 127) {
+                        std::cerr << "sock-forward proxy (pid=" << info.ssi_pid << ") failed to start. Is socat installed?" << std::endl;
+                    } else {
+                        std::cout << "sock-forward proxy (pid=" << info.ssi_pid << ") terminated." << std::endl;
+                    }
                 }
              }
         }
@@ -1400,10 +1417,16 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
 
     if (virtiofsd_pid > 0) os_resources.virtiofsd_pid = virtiofsd_pid;
 
+    uint32_t port_offset = 0;
+    for (const auto& path : options.sock_forward) {
+        auto pid = vsock::run_sock_forward(guest_cid + port_offset++, path);
+        os_resources.sock_forward_pids.push_back(pid);
+    }
+
     std::cout << "Executing QEMU..." << std::endl;
     std::cout << "Guest CID: " << guest_cid << std::endl;
     std::cout << "`ssh user@vsock%" << guest_cid << "` to login to the VM." << std::endl;
-    return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid);
+    return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid, os_resources.sock_forward_pids);
 }
 
 static int run_bios(const RunOptions& options)
@@ -2046,6 +2069,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("-i", "--net").help("Network interface").append();
     run_command.add_argument("--hostfwd").help("pass hostfwd to QEMU").append();
     run_command.add_argument("--guestfwd").help("pass guestfwd to QEMU").append();
+    run_command.add_argument("--sock-forward").help("forward vsock port to host Unix domain socket").append();
     run_command.add_argument("--virtiofs-path").nargs(1);
     run_command.add_argument("--no-kvm").default_value(false).implicit_value(true);
     run_command.add_argument("--append").nargs(1);
@@ -2185,6 +2209,10 @@ static int _main(int argc, char* argv[])
 
         auto hostfwd = run_command.get<std::vector<std::string>>("--hostfwd");
         auto guestfwd = run_command.get<std::vector<std::string>>("--guestfwd");
+        std::vector<std::filesystem::path> sock_forward;
+        for (const auto& s : run_command.get<std::vector<std::string>>("--sock-forward")) {
+            sock_forward.push_back(s);
+        }
 
         std::vector<std::filesystem::path> usb = run_command.present("--usb")?
             query_usb_devices(run_command.get<std::string>("--usb")) : std::vector<std::filesystem::path>();
@@ -2222,6 +2250,7 @@ static int _main(int argc, char* argv[])
                     .net = net,
                     .hostfwd = hostfwd,
                     .guestfwd = guestfwd,
+                    .sock_forward = sock_forward,
                     .usb = usb,
                     .disks = disks,
                     .pci = pci,
@@ -2253,6 +2282,7 @@ static int _main(int argc, char* argv[])
                 .net = net,
                 .hostfwd = hostfwd,
                 .guestfwd = guestfwd,
+                .sock_forward = sock_forward,
                 .usb = usb,
                 .pci = pci,
                 .cdrom = run_command.present("--cdrom"),

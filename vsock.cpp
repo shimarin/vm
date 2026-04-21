@@ -2,6 +2,7 @@
 #include <array>
 #include <vector>
 #include <stdexcept>
+#include <unistd.h>
 
 class SHA256 {
 private:
@@ -109,6 +110,19 @@ public:
 };
 
 namespace vsock {
+    pid_t run_sock_forward(uint32_t vsock_port, const std::filesystem::path& unix_sock_path)
+    {
+        auto pid = fork();
+        if (pid < 0) throw std::runtime_error("fork() failed");
+        if (pid == 0) {
+            std::string listen_arg = "VSOCK-LISTEN:" + std::to_string(vsock_port) + ",fork,reuseaddr";
+            std::string connect_arg = "UNIX-CONNECT:" + unix_sock_path.string();
+            execlp("socat", "socat", listen_arg.c_str(), connect_arg.c_str(), nullptr);
+            _exit(127);
+        }
+        return pid;
+    }
+
     uint32_t determine_guest_cid(uid_t uid, const std::string& vmname) {
         if (vmname.empty()) {
             throw std::invalid_argument("VM name cannot be empty");
