@@ -1402,7 +1402,7 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
 
     std::cout << "Executing QEMU..." << std::endl;
     std::cout << "Guest CID: " << guest_cid << std::endl;
-    std::cout << "`ssh -o ProxyCommand='socat STDIO vsock-connect:" << guest_cid << ":22' user@" << vmname << "` to login to the VM." << std::endl;
+    std::cout << "`ssh user@vsock%" << guest_cid << "` to login to the VM." << std::endl;
     return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid);
 }
 
@@ -2120,18 +2120,6 @@ static int _main(int argc, char* argv[])
     cid_command.add_argument("vmname").nargs(1);
     program.add_subparser(cid_command);
 
-    argparse::ArgumentParser ssh_command("ssh");
-    ssh_command.add_description("SSH to VM");
-    // capture all other arguments and pass to ssh
-    ssh_command.add_argument("ssh_args").nargs(argparse::nargs_pattern::any);
-    program.add_subparser(ssh_command);
-
-    argparse::ArgumentParser scp_command("scp");
-    scp_command.add_description("SCP to/from VM");
-    // capture all other arguments and pass to scp
-    scp_command.add_argument("scp_args").nargs(argparse::nargs_pattern::any);
-    program.add_subparser(scp_command);
-
     try {
         program.parse_args(argc, argv);
     }
@@ -2159,10 +2147,6 @@ static int _main(int argc, char* argv[])
             std::cerr << usb_command;
         } else if (program.is_subcommand_used("cid")) {
             std::cerr << cid_command;
-        } else if (program.is_subcommand_used("ssh")) {
-            std::cerr << ssh_command;
-        } else if (program.is_subcommand_used("scp")) {
-            std::cerr << scp_command;
         } else {
             std::cerr << program;
         }
@@ -2394,60 +2378,6 @@ static int _main(int argc, char* argv[])
         auto cid = vsock::determine_guest_cid(getuid(), vmname);
         std::cout << cid << std::endl;
         return 0;
-    }
-
-    if (program.is_subcommand_used("ssh")) {
-        auto ssh_args = ssh_command.get<std::vector<std::string>>("ssh_args");
-        // determine vmname from ssh_args[-1]
-        if (ssh_args.size() == 0) {
-            std::cerr << "username@vmname is required." << std::endl;
-            return 1;
-        }
-        auto user_at_vmname = ssh_args.back();
-        if (user_at_vmname.find('@') == std::string::npos) {
-            std::cerr << "username@vmname is required." << std::endl;
-            return 1;
-        }
-        auto at_pos = user_at_vmname.find('@');
-        auto colon_pos = user_at_vmname.find(':', at_pos);
-        std::string vmname;
-        if (colon_pos == std::string::npos) {
-            vmname = user_at_vmname.substr(at_pos + 1);
-        } else {
-            vmname = user_at_vmname.substr(at_pos + 1, colon_pos - at_pos - 1);
-        }
-        return vsock::ssh(getuid(), vmname, ssh_args); // never returns if success
-    }
-
-    if (program.is_subcommand_used("scp")) {
-        auto scp_args = scp_command.get<std::vector<std::string>>("scp_args");
-        // determine vmname from scp_args[-1] or scp_args[-2]
-        if (scp_args.size() == 0) {
-            std::cerr << "username@vmname:filepath is required." << std::endl;
-            return 1;
-        }
-        std::string user_at_vmname;
-        if (scp_args.back().find(':') != std::string::npos) {
-            user_at_vmname = scp_args.back();
-        } else if (scp_args.size() >= 2 && scp_args[scp_args.size() - 2].find(':') != std::string::npos) {
-            user_at_vmname = scp_args[scp_args.size() - 2];
-        } else {
-            std::cerr << "username@vmname:filepath is required." << std::endl;
-            return 1;
-        }
-        if (user_at_vmname.find('@') == std::string::npos) {
-            std::cerr << "username@vmname:filepath is required." << std::endl;
-            return 1;
-        }
-        auto at_pos = user_at_vmname.find('@');
-        auto colon_pos = user_at_vmname.find(':', at_pos);
-        std::string vmname;
-        if (colon_pos == std::string::npos) {
-            vmname = user_at_vmname.substr(at_pos + 1);
-        } else {
-            vmname = user_at_vmname.substr(at_pos + 1, colon_pos - at_pos - 1);
-        }
-        return vsock::scp(getuid(), vmname, scp_args); // never returns if success
     }
 
     std::cout << program;
