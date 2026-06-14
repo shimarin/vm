@@ -673,43 +673,6 @@ static pid_t run_virtiofsd(const std::string& vmname, const std::filesystem::pat
     return pid;
 }
 
-static std::optional<std::filesystem::path> generate_ssh_host_keys_archive(const std::string& vmname)
-{
-    auto ssh_host_key_root = run_dir::vm_dir(vmname) / "ssh-host-key";
-    auto ssh_host_key_dir = ssh_host_key_root / "etc" / "ssh";
-    std::filesystem::create_directories(ssh_host_key_dir);
-
-    auto ssh_keygen = fork();
-    if (ssh_keygen < 0) return std::nullopt;
-    //else
-    if (ssh_keygen == 0) {
-        _exit(execlp("ssh-keygen", "ssh-keygen", "-A", "-f", ssh_host_key_root.c_str(), NULL));
-    }
-    //else
-    int ssh_keygen_wstatus;
-    if (waitpid(ssh_keygen, &ssh_keygen_wstatus, 0) < 0 || !WIFEXITED(ssh_keygen_wstatus) || WEXITSTATUS(ssh_keygen_wstatus) != 0) 
-        return std::nullopt;
-    //else
-    auto wfd = memfd_create("ssh-host-keys", 0);
-    if (wfd < 0) return std::nullopt;
-    fchmod(wfd, S_IRUSR);
-    auto tar = fork();
-    if (tar < 0) return std::nullopt;
-    //else
-    if (tar == 0) {
-        dup2(wfd, STDOUT_FILENO);
-        _exit(execlp("tar", "tar", "cf", "-", "-C", ssh_host_key_dir.c_str(), ".", NULL));
-    }
-    //else
-    int tar_wstatus;
-    if (waitpid(tar, &tar_wstatus, 0) < 0 || !WIFEXITED(tar_wstatus) || WEXITSTATUS(tar_wstatus) != 0) {
-        close(wfd);
-        return std::nullopt;
-    }
-    //else
-    return get_proc_fd_path(wfd);
-}
-
 static std::optional<std::filesystem::path> generate_ssh_public_keys(const std::string& vmname)
 {
     auto wfd = memfd_create("ssh-public-keys", 0);
@@ -730,10 +693,6 @@ static std::optional<std::filesystem::path> generate_ssh_public_keys(const std::
         return (r == 0);
     };
     const std::filesystem::path ssh_dir = user_home_dir() / ".ssh";
-    auto authorized_keys = ssh_dir / "authorized_keys";
-    if (std::filesystem::exists(authorized_keys) && std::filesystem::is_regular_file(authorized_keys)) {
-        cat(authorized_keys, wfd);
-    }
     std::vector<std::filesystem::path> ssh_public_key_candidates = {"id_ecdsa.pub", "id_ed25519.pub", "id_rsa.pub"};
     for (const auto& ssh_public_key_candidate:ssh_public_key_candidates) {
         auto ssh_public_key = ssh_dir / ssh_public_key_candidate;
@@ -784,14 +743,6 @@ static void apply_common_args_to_qemu_cmdline(const std::string& vmname, std::ve
         "-fw_cfg", "opt/vmname,string=" + vmname,
         "-pidfile", run_dir::qemu_pid(vmname)
     });
-
-    // generate ssh host key which valid till next reboot
-    auto ssh_host_keys_archive = generate_ssh_host_keys_archive(vmname);
-    if (ssh_host_keys_archive.has_value()) {
-        qemu_cmdline.insert(qemu_cmdline.end(), {
-            "-fw_cfg", "opt/ssh-host-keys,file=" + ssh_host_keys_archive.value().string()
-        });
-    }
 
     // provide ssh public keys through QEMU's fw_cfg
     auto ssh_public_keys = generate_ssh_public_keys(vmname);
