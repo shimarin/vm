@@ -20,6 +20,9 @@
 #include <sys/file.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
+#include <linux/vm_sockets.h>
+#include <thread>
+#include <chrono>
 #include <sys/un.h>
 #include <sys/sysinfo.h>
 #include <sys/stat.h>
@@ -99,7 +102,7 @@ static std::filesystem::path user_home_dir()
 
 static std::filesystem::path get_proc_fd_path(int fd)
 {
-    static auto proc_fd = std::filesystem::path("/proc") / std::to_string(getpid()) / "fd";
+    static auto proc_fd = std::filesystem::path("/proc") / "self" / "fd";
     return proc_fd / std::to_string(fd);
 }
 
@@ -614,6 +617,8 @@ struct RunOptions {
     const std::optional<std::string>& logging_items = std::nullopt;
     const std::optional<std::string>& trace = std::nullopt;
     const std::optional<std::filesystem::path>& logfile = std::nullopt;
+    const bool detach = false;
+    const std::optional<uint32_t> wait_ssh = std::nullopt;
 };
 
 struct VirtiofsdOptions {
@@ -1162,7 +1167,7 @@ static void apply_virtiofs_to_qemu_cmdline(const std::string& vmname, std::vecto
 
 static int run_qemu(const std::string& vmname, const std::vector<std::string>& cmdline,
     const std::map<std::string,std::string>& qemu_env, pid_t virtiofsd_pid = -1,
-    const std::vector<pid_t>& sock_forward_pids = {})
+    const std::vector<pid_t>& sock_forward_pids = {}, int ready_notify_fd = -1)
 {
     // create QGA lock file if not exists
     auto qga_lock_fd = open(run_dir::qga_lock(vmname).c_str(), O_CREAT|O_RDWR, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
@@ -1202,6 +1207,12 @@ static int run_qemu(const std::string& vmname, const std::vector<std::string>& c
             sd_notify(0, "READY=1");
             qemu_ready_notified = true;
             std::cout << "QEMU is running." << std::endl;
+            if (ready_notify_fd >= 0) {
+                char val = 1;
+                ssize_t w = write(ready_notify_fd, &val, 1);
+                (void)w;
+                close(ready_notify_fd);
+            }
         }
         pollfds[0].fd = sigfd;
         pollfds[0].events = POLLIN;
@@ -1348,6 +1359,95 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
 
     auto guest_cid = apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, arch.value(), os_resources);
 
+    // fork before starting virtiofsd/sock-forward so that they are owned by the daemon process
+    int ready_pipe[2] = {-1, -1};
+    if (options.detach) {
+        if (pipe2(ready_pipe, O_CLOEXEC) < 0) {
+            throw std::runtime_error("pipe2() failed");
+        }
+
+        std::cout.flush();
+        std::cerr.flush();
+
+        auto pid = fork();
+        if (pid < 0) throw std::runtime_error("fork() failed");
+        if (pid > 0) {
+            // parent process (terminal invoker)
+            close(ready_pipe[1]);
+
+            char val;
+            ssize_t r = read(ready_pipe[0], &val, 1);
+            close(ready_pipe[0]);
+
+            if (r <= 0) {
+                std::cerr << "VM failed to start or child terminated prematurely." << std::endl;
+                _exit(1); // prevent destructors (releasing lock/killing virtiofsd) from running
+            }
+
+            if (options.wait_ssh.has_value()) {
+                uint32_t timeout_sec = *options.wait_ssh;
+                std::cout << "QEMU is running. Waiting for SSH port (vsock%" << guest_cid << ":22) to become ready..." << std::endl;
+
+                auto start_time = std::chrono::steady_clock::now();
+                bool connected = false;
+
+                while (true) {
+                    int sfd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
+                    if (sfd >= 0) {
+                        struct sockaddr_vm sa{};
+                        sa.svm_family = AF_VSOCK;
+                        sa.svm_cid = guest_cid;
+                        sa.svm_port = 22;
+
+                        if (connect(sfd, (struct sockaddr*)&sa, sizeof(sa)) == 0) {
+                            connected = true;
+                            close(sfd);
+                            break;
+                        }
+                        close(sfd);
+                    }
+
+                    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::steady_clock::now() - start_time
+                    ).count();
+
+                    if (elapsed >= timeout_sec) {
+                        break;
+                    }
+
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+
+                if (connected) {
+                    std::cout << "SSH is ready. Login with: `ssh USERNAME@vsock%" << guest_cid << "` (replace USERNAME with your login user, often root)" << std::endl;
+                    _exit(0); // prevent destructors from running
+                } else {
+                    std::cerr << "Timeout waiting for SSH port to become ready (" << timeout_sec << "s)." << std::endl;
+                    std::cerr << "The VM is still running. You can check the boot progress via serial console: `vm console " << vmname << "`" << std::endl;
+                    std::cerr << "(Press `Ctrl-]` to detach from the console later.)" << std::endl;
+                    _exit(1); // prevent destructors from running
+                }
+            } else {
+                std::cout << "VM " << vmname << " is running in the background." << std::endl;
+                std::cout << "Login via SSH: `ssh USERNAME@vsock%" << guest_cid << "` (replace USERNAME with your login user, often root)" << std::endl;
+                std::cout << "Attach serial console: `vm console " << vmname << "` (Ctrl-] to detach)" << std::endl;
+            }
+
+            _exit(0); // prevent destructors from running
+        }
+
+        // child process (background watcher daemon)
+        close(ready_pipe[0]);
+        setsid();
+        int dev_null = open("/dev/null", O_RDWR);
+        if (dev_null >= 0) {
+            dup2(dev_null, STDIN_FILENO);
+            dup2(dev_null, STDOUT_FILENO);
+            dup2(dev_null, STDERR_FILENO);
+            close(dev_null);
+        }
+    }
+
     // if VM uses PCI-passthrough, create iommu-mem file and write memory size to it
     bool iommu = options.pci.size() > 0 || std::any_of(options.net.begin(), options.net.end(), [](const auto& t) {
         return std::holds_alternative<netif::type::SRIOV>(std::get<0>(t));
@@ -1359,7 +1459,6 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
     auto virtiofsd_pid = [&]() {
         if (!options.virtiofs_path.has_value()) return -1;
         //else
-        std::cout << "Starting virtiofsd with " << options.virtiofs_path.value().string() << "..." << std::endl;
         auto pid = run_virtiofsd(vmname, options.virtiofs_path.value(), 
             {options.virtiofs_rlimit_nofile, options.virtiofs_cache, options.virtiofs_inode_file_handles});
         apply_virtiofs_to_qemu_cmdline(vmname, qemu_cmdline, pid);
@@ -1374,10 +1473,13 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
         os_resources.sock_forward_pids.push_back(pid);
     }
 
-    std::cout << "Executing QEMU..." << std::endl;
-    std::cout << "Guest CID: " << guest_cid << std::endl;
-    std::cout << "`ssh user@vsock%" << guest_cid << "` to login to the VM." << std::endl;
-    return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid, os_resources.sock_forward_pids);
+    if (!options.detach) {
+        std::cout << "Executing QEMU..." << std::endl;
+        std::cout << "Guest CID: " << guest_cid << std::endl;
+        std::cout << "Login with: `ssh USERNAME@vsock%" << guest_cid << "` (replace USERNAME with your login user, often root)" << std::endl;
+    }
+
+    return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid, os_resources.sock_forward_pids, ready_pipe[1]);
 }
 
 static int run_bios(const RunOptions& options)
@@ -2041,6 +2143,9 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--trace").nargs(1).help("Tracing options for QEMU");
     run_command.add_argument("--logfile").nargs(1).help("Log file to output instead of stderr");
     run_command.add_argument("--9p").append().help("Directory to share with guest via 9pfs (path:mount_tag)");
+    run_command.add_argument("--detach").default_value(false).implicit_value(true).help("Run VM in the background (detached)");
+    run_command.add_argument("--wait-ssh").default_value(false).implicit_value(true).help("Wait for guest SSH to become ready");
+    run_command.add_argument("--wait-ssh-timeout").scan<'u', uint32_t>().help("Override SSH wait timeout in seconds (default 30)");
     program.add_subparser(run_command);
 
     argparse::ArgumentParser service_command("service");
@@ -2060,6 +2165,8 @@ static int _main(int argc, char* argv[])
     stop_command.add_description("Stop VM");
     stop_command.add_argument("-c", "--console").default_value(false).implicit_value(true);
     stop_command.add_argument("-f", "--force").default_value(false).implicit_value(true);
+    stop_command.add_argument("-w", "--wait").default_value(false).implicit_value(true);
+    stop_command.add_argument("--wait-timeout").scan<'u', uint32_t>().help("Seconds to wait before giving up (default 30)");
     stop_command.add_argument("vmname").nargs(1);
     program.add_subparser(stop_command);
 
@@ -2133,6 +2240,20 @@ static int _main(int argc, char* argv[])
     }
 
     if (program.is_subcommand_used("run")) {
+        bool detach     = run_command.get<bool>("--detach");
+        bool wait_ssh   = run_command.get<bool>("--wait-ssh");
+        auto timeout_ov = run_command.present<uint32_t>("--wait-ssh-timeout");
+
+        if (wait_ssh && !detach) {
+            throw std::runtime_error("--wait-ssh is only valid when --detach is specified.");
+        }
+        if (timeout_ov.has_value() && !wait_ssh) {
+            throw std::runtime_error("--wait-ssh-timeout requires --wait-ssh.");
+        }
+
+        std::optional<uint32_t> wait_ssh_opt =
+            wait_ssh ? std::optional<uint32_t>(timeout_ov.value_or(30)) : std::nullopt;
+
         const auto system_file = run_command.get("system_file");
         auto volatile_data = run_command.get<bool>("--volatile-data");
         const auto data_file = run_command.present("-d");
@@ -2214,12 +2335,14 @@ static int _main(int argc, char* argv[])
                     .rendernode = run_command.present("--rendernode"),
                     .resolution = resolution,
                     .hvc = run_command.get<bool>("--hvc"),
-                    .stdio_console = true,
+                    .stdio_console = !detach,
                     .no_shutdown = run_command.get<bool>("--no-shutdown"),
                     .firmware_files = firmware_files,
                     .logging_items = run_command.present("--logging-items"),
                     .trace = run_command.present("--trace"),
-                    .logfile = run_command.present("--logfile")
+                    .logfile = run_command.present("--logfile"),
+                    .detach = detach,
+                    .wait_ssh = wait_ssh_opt
                 } );
         }
         // else 
@@ -2246,12 +2369,14 @@ static int _main(int argc, char* argv[])
                 .rendernode = run_command.present("--rendernode"),
                 .resolution = resolution,
                 .hvc = run_command.get<bool>("--hvc"),
-                .stdio_console = true,
+                .stdio_console = !detach,
                 .no_shutdown = run_command.get<bool>("--no-shutdown"),
                 .firmware_files = firmware_files,
                 .logging_items = run_command.present("--logging-items"),
                 .trace = run_command.present("--trace"),
-                .logfile = run_command.present("--logfile")
+                .logfile = run_command.present("--logfile"),
+                .detach = detach,
+                .wait_ssh = wait_ssh_opt
             } );
     }
 
@@ -2273,11 +2398,38 @@ static int _main(int argc, char* argv[])
     if (program.is_subcommand_used("stop")) {
         auto vmname = stop_command.get("vmname");
         bool force = stop_command.get<bool>("-f");
+        bool wait = stop_command.get<bool>("-w");
+        uint32_t wait_timeout = stop_command.present<uint32_t>("--wait-timeout").value_or(30);
 
         if (!qmp_shutdown(vmname, force)) throw std::runtime_error("Shutting down " + vmname + " failed.(not running?)");
         //else
         if (!force && stop_command.get<bool>("-c")) return console(vmname);
         //else
+        if (wait) {
+            std::cout << "Waiting for " << vmname << " to stop..." << std::endl;
+            auto stop_start = std::chrono::steady_clock::now();
+            bool stopped = false;
+            while (true) {
+                if (!run_dir::is_running(vmname)) {
+                    stopped = true;
+                    break;
+                }
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::steady_clock::now() - stop_start
+                ).count();
+                if (elapsed >= wait_timeout) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+            if (stopped) {
+                std::cout << vmname << " stopped." << std::endl;
+            } else {
+                std::cerr << vmname << " did not stop within " << wait_timeout << "s. It may still be shutting down.\n"
+                          << "Run `vm stop -f " << vmname << "` to force termination." << std::endl;
+                return 1;
+            }
+        }
         return 0;
     }
 
