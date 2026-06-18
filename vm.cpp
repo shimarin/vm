@@ -1388,10 +1388,15 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
                 uint32_t timeout_sec = *options.wait_ssh;
                 std::cout << "QEMU is running. Waiting for SSH port (vsock%" << guest_cid << ":22) to become ready..." << std::endl;
 
+                static volatile sig_atomic_t ssh_wait_interrupted = 0;
+                struct sigaction sa_int{};
+                sa_int.sa_handler = [](int) { ssh_wait_interrupted = 1; };
+                sigaction(SIGINT, &sa_int, nullptr);
+
                 auto start_time = std::chrono::steady_clock::now();
                 bool connected = false;
 
-                while (true) {
+                while (!ssh_wait_interrupted) {
                     int sfd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
                     if (sfd >= 0) {
                         struct sockaddr_vm sa{};
@@ -1422,7 +1427,11 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
                     std::cout << "SSH is ready. Login with: `ssh USERNAME@vsock%" << guest_cid << "` (replace USERNAME with your login user, often root)" << std::endl;
                     _exit(0); // prevent destructors from running
                 } else {
-                    std::cerr << "Timeout waiting for SSH port to become ready (" << timeout_sec << "s)." << std::endl;
+                    if (ssh_wait_interrupted) {
+                        std::cerr << "Waiting for SSH interrupted by Ctrl-C." << std::endl;
+                    } else {
+                        std::cerr << "Timeout waiting for SSH port to become ready (" << timeout_sec << "s)." << std::endl;
+                    }
                     std::cerr << "The VM is still running. You can check the boot progress via serial console: `vm console " << vmname << "`" << std::endl;
                     std::cerr << "(Press `Ctrl-]` to detach from the console later.)" << std::endl;
                     _exit(1); // prevent destructors from running
