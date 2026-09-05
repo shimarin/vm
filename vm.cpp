@@ -2126,6 +2126,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--bios").default_value(false).implicit_value(true);
     run_command.add_argument("--no-virtio-for-bios-disks").default_value(false).implicit_value(true);
     run_command.add_argument("-d", "--data-file").nargs(1).help("Data file(or D drive image in BIOS mode)");
+    run_command.add_argument("--swap-file").nargs(1).help("Swap disk image (not supported in BIOS mode)");
     run_command.add_argument("--volatile-data").default_value(false).implicit_value(true);
     run_command.add_argument("--cdrom").nargs(1);
     run_command.add_argument("-i", "--net").help("Network interface").append();
@@ -2266,6 +2267,10 @@ static int _main(int argc, char* argv[])
         const auto system_file = run_command.get("system_file");
         auto volatile_data = run_command.get<bool>("--volatile-data");
         const auto data_file = run_command.present("-d");
+        const auto swap_file = run_command.present("--swap-file");
+        if (swap_file.has_value() && run_command.get<bool>("--bios")) {
+            throw std::runtime_error("--swap-file is not supported in BIOS mode.");
+        }
         if (volatile_data && data_file.has_value()) {
             throw std::runtime_error("--volatile-data and --data-file(-d) are exclusive.");
         }
@@ -2355,7 +2360,7 @@ static int _main(int argc, char* argv[])
                 } );
         }
         // else 
-        return run(system_file, real_data_file, std::nullopt, {
+        return run(system_file, real_data_file, swap_file, {
                 .name = run_command.present("-n"),
                 .virtiofs_path = run_command.present("--virtiofs-path"),
                 .p9 = p9,
