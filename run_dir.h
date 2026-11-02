@@ -19,6 +19,7 @@ namespace run_dir {
     inline auto qga_sock(const std::string& vmname) {return vm_dir(vmname) / "qga.sock";}
     inline auto qga_lock(const std::string& vmname) {return vm_dir(vmname) / "qga.lock";}
     inline auto virtiofs_sock(const std::string& vmname) {return vm_dir(vmname) / "virtiofs.sock";}
+    inline auto vsock_dir(const std::string& vmname) {return vm_dir(vmname) / "vsock";}
     inline auto iommu_mem(const std::string& vmname) {return vm_dir(vmname) / "iommu-mem";}
 
     template <typename T>

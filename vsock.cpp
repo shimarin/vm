@@ -2,6 +2,14 @@
 #include <array>
 #include <vector>
 #include <stdexcept>
+#include <string>
+#include <cstring>
+#include <cstdlib>
+#include <csignal>
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/prctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 class SHA256 {
@@ -110,17 +118,109 @@ public:
 };
 
 namespace vsock {
+    namespace {
+        // Block SIGCHLD while a proxy is being created, so that a proxy which dies
+        // immediately cannot lose its notification before run_qemu() sets up its
+        // signalfd. The previous mask is handed back so that the proxy (and QEMU)
+        // can be execed without the block.
+        void block_sigchld(sigset_t& previous)
+        {
+            sigset_t mask;
+            sigemptyset(&mask);
+            sigaddset(&mask, SIGCHLD);
+            if (sigprocmask(SIG_BLOCK, &mask, &previous) != 0) throw std::runtime_error(std::string("sigprocmask() failed: ") + strerror(errno));
+        }
+
+        // Drop the descriptors inherited from the vm process. The VM lock fd in
+        // particular must not survive: an orphaned proxy would otherwise keep the
+        // name locked and make the VM look like it is still running.
+        void close_inherited_fds(int keep)
+        {
+            std::vector<int> fds;
+            if (auto dir = opendir("/proc/self/fd")) {
+                while (auto entry = readdir(dir)) {
+                    auto fd = atoi(entry->d_name);
+                    if (fd > STDERR_FILENO && fd != keep) fds.push_back(fd);
+                }
+                closedir(dir);
+            }
+            for (auto fd : fds) close(fd);
+        }
+
+        // Start a proxy process (socat). The child refuses to outlive the vm
+        // process and hands the exec result back through a close-on-exec pipe:
+        // a successful exec closes the write end and the parent reads EOF, while
+        // a failed exec delivers the errno.
+        pid_t run_proxy(const char* chdir_to, const std::vector<std::string>& args)
+        {
+            sigset_t previous_mask;
+            block_sigchld(previous_mask); // before fork(): a proxy that dies immediately must not slip through
+
+            int handshake[2];
+            if (pipe2(handshake, O_CLOEXEC) < 0) {
+                sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+                throw std::runtime_error(std::string("pipe2() failed: ") + strerror(errno));
+            }
+
+            auto parent = getpid();
+            auto pid = fork();
+            if (pid < 0) {
+                close(handshake[0]); close(handshake[1]);
+                sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+                throw std::runtime_error("fork() failed");
+            }
+            if (pid == 0) {
+                auto die = [&](int err) {
+                    ssize_t w = write(handshake[1], &err, sizeof(err));
+                    (void)w;
+                    _exit(127);
+                };
+                close(handshake[0]);
+                if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) die(errno);
+                if (getppid() != parent) die(ESHUTDOWN); // the parent died before prctl() took effect
+                sigdelset(&previous_mask, SIGCHLD); // the block is ours to hold, not socat's to inherit
+                sigprocmask(SIG_SETMASK, &previous_mask, nullptr);
+                if (chdir_to && chdir(chdir_to) != 0) die(errno);
+                close_inherited_fds(handshake[1]);
+                std::vector<char*> argv;
+                for (const auto& arg : args) argv.push_back(const_cast<char*>(arg.c_str()));
+                argv.push_back(nullptr);
+                execvp(argv[0], argv.data());
+                die(errno);
+            }
+
+            close(handshake[1]);
+            auto err = 0;
+            auto r = read(handshake[0], &err, sizeof(err)); // blocks until exec succeeds (EOF) or the child reports
+            close(handshake[0]);
+            if (r != 0) {
+                waitpid(pid, nullptr, 0);
+                throw std::runtime_error(std::string("Failed to start ") + args.front() + ": "
+                    + (r == sizeof(err)? strerror(err) : "the process terminated immediately"));
+            }
+            return pid;
+        }
+    } // namespace
+
     pid_t run_sock_forward(uint32_t vsock_port, const std::filesystem::path& unix_sock_path)
     {
-        auto pid = fork();
-        if (pid < 0) throw std::runtime_error("fork() failed");
-        if (pid == 0) {
-            std::string listen_arg = "VSOCK-LISTEN:" + std::to_string(vsock_port) + ",fork,reuseaddr";
-            std::string connect_arg = "UNIX-CONNECT:" + unix_sock_path.string();
-            execlp("socat", "socat", listen_arg.c_str(), connect_arg.c_str(), nullptr);
-            _exit(127);
-        }
-        return pid;
+        return run_proxy(nullptr, {
+            "socat",
+            "VSOCK-LISTEN:" + std::to_string(vsock_port) + ",fork,reuseaddr",
+            "UNIX-CONNECT:" + unix_sock_path.string()
+        });
+    }
+
+    // The socket is created relative to dir (which the child chdir()s to) so that
+    // long or oddly-named run directories cannot overflow sun_path or confuse
+    // socat's address parser.
+    pid_t run_vsock_export(uint32_t guest_cid, uint32_t vsock_port, const std::filesystem::path& dir, const std::string& socket_name)
+    {
+        return run_proxy(dir.c_str(), {
+            "socat",
+            "UNIX-LISTEN:" + socket_name + ",fork",
+            "VSOCK-CONNECT:" + std::to_string(guest_cid) + ":" + std::to_string(vsock_port)
+        });
     }
 
     uint32_t determine_guest_cid(uid_t uid, const std::string& vmname) {

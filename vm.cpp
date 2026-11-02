@@ -6,6 +6,7 @@
 #include <cassert>
 #include <future>
 #include <set>
+#include <charconv>
 //#include <format>
 
 #include <string.h>
@@ -572,6 +573,33 @@ static std::pair<std::filesystem::path,std::string> parse_9p(const std::string& 
     return {str.substr(0, pos), str.substr(pos + 1)};
 }
 
+struct VsockExport {
+    uint32_t port;
+    std::string name;
+};
+
+static VsockExport parse_vsock_export(const std::string& str)
+{
+    auto invalid = [&](const std::string& reason) {
+        return std::runtime_error("Invalid --export-vsock: " + str + " (" + reason + ", expected PORT[:NAME])");
+    };
+
+    auto pos = str.find(':');
+    auto port_str = pos == std::string::npos? str : str.substr(0, pos);
+    auto name = pos == std::string::npos? port_str : str.substr(pos + 1);
+
+    uint32_t port = 0;
+    auto [ptr, ec] = std::from_chars(port_str.data(), port_str.data() + port_str.size(), port);
+    if (ec != std::errc{} || ptr != port_str.data() + port_str.size() || port == 0 || port == 0xFFFFFFFF/*VMADDR_PORT_ANY*/) {
+        throw invalid("port must be 1-4294967294");
+    }
+    if (name.empty() || name.size() > 64 || name.find_first_not_of('.') == std::string::npos
+        || name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") != std::string::npos) {
+        throw invalid("NAME must be 1-64 characters of [A-Za-z0-9._-]");
+    }
+    return {port, name};
+}
+
 struct RunOptions {
     const std::optional<std::string>& name = std::nullopt;
     const std::optional<std::filesystem::path>& virtiofs_path = std::nullopt;
@@ -583,6 +611,7 @@ struct RunOptions {
     const std::vector<std::string> hostfwd = {};
     const std::vector<std::string> guestfwd = {};
     const std::vector<std::filesystem::path> sock_forward = {};
+    const std::vector<VsockExport> export_vsock = {};
     const std::vector<std::filesystem::path>& usb = {};
     const std::vector<std::tuple<std::filesystem::path,bool/*virtio*/,std::optional<std::string>/*serial*/>>& disks = {};
     const std::vector<std::tuple<std::string,bool,bool,std::optional<std::string>>>& pci = {};
@@ -767,11 +796,16 @@ static bool is_emulation_needed(const std::string& arch)
     return (arch != uts.machine);
 }
 
+struct proxy_process {
+    pid_t pid;
+    std::string description; // the option that requested it, for diagnostics
+};
+
 struct qemu_os_resources {
     std::optional<int> vm_run_dir_lock_fd;
     std::vector<int> pci_locks;
     std::optional<pid_t> virtiofsd_pid;
-    std::vector<pid_t> sock_forward_pids;
+    std::vector<proxy_process> proxies;
     std::set<int> fds;
     ~qemu_os_resources() {
         for (auto fd:fds) close(fd);
@@ -782,9 +816,9 @@ struct qemu_os_resources {
             waitpid(*virtiofsd_pid, NULL, 0);
         }
 
-        for (auto pid : sock_forward_pids) {
-            kill(pid, SIGTERM);
-            waitpid(pid, NULL, 0);
+        for (const auto& proxy : proxies) {
+            kill(proxy.pid, SIGTERM);
+            waitpid(proxy.pid, NULL, 0);
         }
 
         if (vm_run_dir_lock_fd.has_value() && *vm_run_dir_lock_fd >= 0) {
@@ -1167,7 +1201,7 @@ static void apply_virtiofs_to_qemu_cmdline(const std::string& vmname, std::vecto
 
 static int run_qemu(const std::string& vmname, const std::vector<std::string>& cmdline,
     const std::map<std::string,std::string>& qemu_env, pid_t virtiofsd_pid = -1,
-    const std::vector<pid_t>& sock_forward_pids = {}, int ready_notify_fd = -1)
+    const std::vector<proxy_process>& proxies = {}, int ready_notify_fd = -1)
 {
     // create QGA lock file if not exists
     auto qga_lock_fd = open(run_dir::qga_lock(vmname).c_str(), O_CREAT|O_RDWR, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
@@ -1180,6 +1214,12 @@ static int run_qemu(const std::string& vmname, const std::vector<std::string>& c
     auto qemu_pid = fork();
     if (qemu_pid < 0) throw std::runtime_error("fork() failed");
     if (qemu_pid == 0) { // child process
+        // Spawning the proxies blocks SIGCHLD in this process; QEMU must start as if
+        // no proxy had been requested, so hand it a clean mask.
+        sigset_t unblocked;
+        sigemptyset(&unblocked);
+        sigprocmask(SIG_SETMASK, &unblocked, nullptr);
+
         for (const auto&[name,value]:qemu_env) {
             setenv(name.c_str(), value.c_str(), 1);
         }
@@ -1233,14 +1273,13 @@ static int run_qemu(const std::string& vmname, const std::vector<std::string>& c
                 if (info.ssi_pid == qemu_pid) break; // QEMU terminated
                 else if (info.ssi_pid == virtiofsd_pid) {
                     std::cout << "virtiofsd terminated!" << std::endl;
-                } else if (std::find(sock_forward_pids.begin(), sock_forward_pids.end(), (pid_t)info.ssi_pid)
-                           != sock_forward_pids.end()) {
-                    int wstatus;
-                    waitpid(info.ssi_pid, &wstatus, WNOHANG);
-                    if (WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 127) {
-                        std::cerr << "sock-forward proxy (pid=" << info.ssi_pid << ") failed to start. Is socat installed?" << std::endl;
-                    } else {
-                        std::cout << "sock-forward proxy (pid=" << info.ssi_pid << ") terminated." << std::endl;
+                } else {
+                    auto proxy = std::find_if(proxies.begin(), proxies.end(),
+                        [&](const proxy_process& p) { return p.pid == info.ssi_pid; });
+                    if (proxy != proxies.end()) {
+                        int wstatus;
+                        waitpid(info.ssi_pid, &wstatus, WNOHANG);
+                        std::cerr << "proxy for " << proxy->description << " (pid=" << info.ssi_pid << ") terminated." << std::endl;
                     }
                 }
              }
@@ -1255,6 +1294,56 @@ static int run_qemu(const std::string& vmname, const std::vector<std::string>& c
     //else
     return WEXITSTATUS(qemu_wstatus);
 }
+
+// Expose guest vsock ports as Unix domain sockets on the host, under
+// $XDG_RUNTIME_DIR/vm/<vmname>/vsock/<name>.sock (the reverse direction of --sock-forward).
+static void spawn_vsock_exports(const std::string& vmname, uint32_t guest_cid,
+                                const std::vector<VsockExport>& exports, qemu_os_resources& os_resources)
+{
+    auto dir = run_dir::vsock_dir(vmname);
+    // Sockets left behind by a VM that was killed (SIGKILL prevents socat from
+    // unlinking them) must not be reported by vm show. The VM lock is held here,
+    // so no running VM can be affected.
+    std::filesystem::remove_all(dir);
+    if (exports.empty()) return;
+    std::filesystem::create_directories(dir);
+
+    for (const auto& e : exports) {
+        auto socket_name = e.name + ".sock";
+        auto path = dir / socket_name;
+        auto pid = vsock::run_vsock_export(guest_cid, e.port, dir, socket_name);
+        os_resources.proxies.push_back({pid, "--export-vsock " + std::to_string(e.port) + ":" + e.name});
+
+        // exec succeeding is not enough: socat can still fail to bind. Wait for
+        // the socket to appear so that such a failure is reported here instead of
+        // leaving the VM running with no way to reach it.
+        bool bound = false;
+        for (int i = 0; i < 100; i++) { // socat binds within a few milliseconds
+            std::error_code ec;
+            if (std::filesystem::is_socket(path, ec)) { bound = true; break; }
+            int wstatus;
+            if (waitpid(pid, &wstatus, WNOHANG) == pid) {
+                os_resources.proxies.pop_back();
+                throw std::runtime_error("Failed to export vsock port " + std::to_string(e.port) + " as "
+                    + path.string() + ": the proxy terminated immediately"
+                    + (WIFEXITED(wstatus) && WEXITSTATUS(wstatus) == 127? ". Is socat installed?" : ""));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        if (!bound) {
+            kill(pid, SIGTERM);
+            waitpid(pid, nullptr, 0);
+            os_resources.proxies.pop_back();
+            throw std::runtime_error("Failed to export vsock port " + std::to_string(e.port)
+                + " as " + path.string() + ": the socket did not appear");
+        }
+        std::cout << "Exporting vsock port " << e.port << " as " << path.string() << std::endl;
+    }
+}
+
+// Set in the detached daemon's child: a startup failure has no stderr of its own,
+// so the message is written here and re-raised by the terminal invoker.
+static int detach_report_fd = -1;
 
 static int run(const std::optional<std::filesystem::path>& system_file, const std::optional<std::filesystem::path>& data_file, 
     const std::optional<std::filesystem::path>& swap_file, const RunOptions& options)
@@ -1375,13 +1464,19 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
             // parent process (terminal invoker)
             close(ready_pipe[1]);
 
-            char val;
-            ssize_t r = read(ready_pipe[0], &val, 1);
+            std::array<char, 4096> report;
+            ssize_t r = read(ready_pipe[0], report.data(), report.size());
             close(ready_pipe[0]);
 
             if (r <= 0) {
                 std::cerr << "VM failed to start or child terminated prematurely." << std::endl;
                 _exit(1); // prevent destructors (releasing lock/killing virtiofsd) from running
+            }
+            if (!(r == 1 && report[0] == 1)) {
+                // the daemon reported why it could not start (it has no stderr of its own)
+                std::cerr << "VM " << vmname << " failed to start: "
+                    << std::string(report.data(), static_cast<size_t>(r)) << std::endl;
+                _exit(1);
             }
 
             if (options.wait_ssh.has_value()) {
@@ -1447,6 +1542,7 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
 
         // child process (background watcher daemon)
         close(ready_pipe[0]);
+        detach_report_fd = ready_pipe[1]; // report startup failures to the terminal invoker
         setsid();
         int dev_null = open("/dev/null", O_RDWR);
         if (dev_null >= 0) {
@@ -1476,10 +1572,12 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
 
     if (virtiofsd_pid > 0) os_resources.virtiofsd_pid = virtiofsd_pid;
 
+    spawn_vsock_exports(vmname, guest_cid, options.export_vsock, os_resources);
+
     uint32_t port_offset = 0;
     for (const auto& path : options.sock_forward) {
         auto pid = vsock::run_sock_forward(guest_cid + port_offset++, path);
-        os_resources.sock_forward_pids.push_back(pid);
+        os_resources.proxies.push_back({pid, "--sock-forward " + path.string()});
     }
 
     if (!options.detach) {
@@ -1488,7 +1586,7 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
         std::cout << "Login with: `ssh USERNAME@vsock%" << guest_cid << "` (replace USERNAME with your login user, often root)" << std::endl;
     }
 
-    return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid, os_resources.sock_forward_pids, ready_pipe[1]);
+    return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid, os_resources.proxies, ready_pipe[1]);
 }
 
 static int run_bios(const RunOptions& options)
@@ -1507,7 +1605,7 @@ static int run_bios(const RunOptions& options)
     };
 
     apply_common_args_to_qemu_cmdline(vmname, qemu_cmdline);
-    apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, "x86_64", os_resources, true);
+    auto guest_cid = apply_options_to_qemu_cmdline(vmname, qemu_cmdline, options, "x86_64", os_resources, true);
     if (options.cdrom.has_value()) {
         qemu_cmdline.insert(qemu_cmdline.end(), {"-boot", "once=d"});
     }
@@ -1524,8 +1622,16 @@ static int run_bios(const RunOptions& options)
 
     if (virtiofsd_pid > 0) os_resources.virtiofsd_pid = virtiofsd_pid;
 
+    spawn_vsock_exports(vmname, guest_cid, options.export_vsock, os_resources);
+
+    uint32_t port_offset = 0;
+    for (const auto& path : options.sock_forward) {
+        auto pid = vsock::run_sock_forward(guest_cid + port_offset++, path);
+        os_resources.proxies.push_back({pid, "--sock-forward " + path.string()});
+    }
+
     std::cout << "Executing QEMU(BIOS)..." << std::endl;
-    return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid);
+    return run_qemu(vmname, qemu_cmdline, options.qemu_env, virtiofsd_pid, os_resources.proxies);
 }
 
 static std::string escape_comma_for_qemu(const std::string& str)
@@ -1966,6 +2072,15 @@ static int show(std::optional<std::string> vmname)
             obj["qga"] = run_dir::qga_sock(vmname);
             obj["qga_lock"] = run_dir::qga_lock(vmname);
         }
+        auto vsock_dir = run_dir::vsock_dir(vmname);
+        if (std::filesystem::is_directory(vsock_dir)) {
+            nlohmann::json exports = nlohmann::json::object();
+            for (const auto& entry : std::filesystem::directory_iterator(vsock_dir)) {
+                if (!std::filesystem::is_socket(entry.path())) continue;
+                exports[entry.path().stem().string()] = entry.path();
+            }
+            if (!exports.empty()) obj["vsock_exports"] = exports;
+        }
     };
 
     if (vmname.has_value()) {
@@ -2133,6 +2248,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--hostfwd").help("pass hostfwd to QEMU").append();
     run_command.add_argument("--guestfwd").help("pass guestfwd to QEMU").append();
     run_command.add_argument("--sock-forward").help("forward vsock port to host Unix domain socket").append();
+    run_command.add_argument("--export-vsock").help("expose guest vsock port as host Unix domain socket (PORT[:NAME])").append();
     run_command.add_argument("--virtiofs-path").nargs(1);
     run_command.add_argument("--no-kvm").default_value(false).implicit_value(true);
     run_command.add_argument("--append").nargs(1);
@@ -2300,6 +2416,19 @@ static int _main(int argc, char* argv[])
             sock_forward.push_back(s);
         }
 
+        std::vector<VsockExport> export_vsock;
+        for (const auto& s : run_command.get<std::vector<std::string>>("--export-vsock")) {
+            export_vsock.push_back(parse_vsock_export(s));
+        }
+        {
+            std::set<std::string> names;
+            for (const auto& e : export_vsock) {
+                if (!names.insert(e.name).second) {
+                    throw std::runtime_error("Duplicate --export-vsock name: " + e.name);
+                }
+            }
+        }
+
         std::vector<std::filesystem::path> usb = run_command.present("--usb")?
             query_usb_devices(run_command.get<std::string>("--usb")) : std::vector<std::filesystem::path>();
 
@@ -2337,6 +2466,7 @@ static int _main(int argc, char* argv[])
                     .hostfwd = hostfwd,
                     .guestfwd = guestfwd,
                     .sock_forward = sock_forward,
+                    .export_vsock = export_vsock,
                     .usb = usb,
                     .disks = disks,
                     .pci = pci,
@@ -2371,6 +2501,7 @@ static int _main(int argc, char* argv[])
                 .hostfwd = hostfwd,
                 .guestfwd = guestfwd,
                 .sock_forward = sock_forward,
+                .export_vsock = export_vsock,
                 .usb = usb,
                 .pci = pci,
                 .cdrom = run_command.present("--cdrom"),
@@ -2555,6 +2686,12 @@ int main(int argc, char* argv[])
         return _main(argc, argv);
     }
     catch (const std::runtime_error& err) {
+        if (detach_report_fd >= 0) {
+            // a detached daemon has no terminal: hand the reason back to the invoker
+            ssize_t w = write(detach_report_fd, err.what(), strlen(err.what()));
+            (void)w;
+            close(detach_report_fd);
+        }
         std::cerr << err.what() << std::endl;
         return 1;
     }
