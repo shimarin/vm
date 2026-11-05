@@ -31,8 +31,6 @@
 #include <sys/utsname.h>
 #include <linux/fs.h>
 #include <ext2fs/ext2_fs.h>
-#include <linux/cryptouser.h>
-#include <linux/if_alg.h>
 
 #include <libsmartcols/libsmartcols.h>
 #include <systemd/sd-daemon.h>
@@ -59,38 +57,6 @@ public:
     Finally(std::function<void(const T&)> _func, const T& _arg) : func(_func), arg(_arg) {}
     ~Finally() { func(arg); }
 };
-
-static void MD5(const uint8_t* data, size_t length, uint8_t result[16])
-{
-    struct sockaddr_alg sa = {
-        .salg_family = AF_ALG,
-        .salg_type = "hash",
-        .salg_name = "md5"
-    };
-    
-    int tfmfd = socket(AF_ALG, SOCK_SEQPACKET, 0);
-    if (tfmfd == -1) throw std::runtime_error("MD5: socket() failed");
-    //else
-    Finally<int> tfmfd_cleanup([](auto fd){
-        close(fd);
-    }, tfmfd);
-
-    if (bind(tfmfd, (struct sockaddr *)&sa, sizeof(sa)) == -1) 
-        throw std::runtime_error("MD5: bind() failed");
-
-    int opfd = accept(tfmfd, NULL, 0);
-    if (opfd == -1) throw std::runtime_error("MD5: accept() failed");
-    //else
-    Finally<int> opfd_cleanup([](auto fd){
-        close(fd);
-    }, opfd);
-
-    if (write(opfd, data, length) == -1) 
-        throw std::runtime_error("MD5: write() failed");
-
-    if (read(opfd, result, 16) == -1) 
-        throw std::runtime_error("MD5: read() failed");
-}
 
 static std::filesystem::path user_home_dir()
 {
@@ -1029,20 +995,8 @@ static uint32_t/*cid*/ apply_options_to_qemu_cmdline(const std::string& vmname,
     bool has_user_net = false;
     for (const auto& [net,macaddr,vhost]:options.net) {
         if (std::holds_alternative<netif::type::SRIOV>(net)) continue; // Already handled
-        auto generate_macaddr_from_name = [](const std::string& vmname, int num) {
-            std::string name = vmname + ":" + std::to_string(num);
-            unsigned char buf[16];
-            MD5((const uint8_t*)name.c_str(), name.length(), buf);
-            uint8_t mac[6] = { 0x52, 0x54, 0x00, 0x00, 0x00, 0x00 };
-            mac[3] = buf[0] & 0x7f;
-            mac[4] = buf[1];
-            mac[5] = buf[2];
-            char mac_str[18];
-            sprintf(mac_str, "%02x:%02x:%02x:%02x:%02x:%02x", (int)mac[0], (int)mac[1], (int)mac[2], (int)mac[3], (int)mac[4], (int)mac[5]);
-            return std::string(mac_str);
-        };
         const auto net_id = "net" + std::to_string(net_num);
-        std::string _macaddr = macaddr.value_or(generate_macaddr_from_name(vmname, net_num));
+        std::string _macaddr = macaddr ? *macaddr : netif::generate_macaddr_from_name(vmname, net_num);
         std::string netdev = [&net_id,&net,&vhost,&_macaddr,&os_resources]() {
             if (std::holds_alternative<netif::type::User>(net)) {
                 return "user,id=" + net_id;

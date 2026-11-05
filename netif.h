@@ -33,4 +33,5 @@ namespace netif {
     bool make_interface_up(const std::string& ifname);
     std::tuple<std::string,int> open_macvtap(const std::string& ifname);
     std::optional<std::string> get_vf_pci_id(const std::string& pf_name, int vf_number);
+    std::string generate_macaddr_from_name(const std::string& vmname, int net_num);
 }

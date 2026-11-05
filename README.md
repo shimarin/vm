@@ -15,6 +15,11 @@ A tool to run genpack'ed system image as a QEMU virtual machine
 
 `socat` is required at runtime for `--sock-forward` and `--export-vsock`.
 
+Each network interface without an explicit `macaddr` gets one derived from `MD5("<vmname>:<net_num>")`.
+That MD5 is implemented in `netif.cpp` so that no crypto library is needed (the kernel's AF_ALG interface
+requires privileges for md5 since Linux v7.3); `make test` checks it against known vectors. Changing the
+algorithm would change every auto-assigned MAC address, so it is kept as MD5.
+
 ## Talking to the guest over vsock
 
 Each VM is given a `vhost-vsock` device with a CID derived from its name (the first four bytes of
