@@ -1,5 +1,8 @@
 #include "system_image.h"
 
+#include <algorithm>
+#include <charconv>
+#include <cerrno>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +21,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -429,22 +433,230 @@ namespace system_image {
 
     metadata::metadata(std::filesystem::path ro_root) : dir(ro_root / ".genpack") {}
 
+    std::optional<std::string> metadata::read_key(const std::string& key, std::string& problem) const
+    {
+        // The names under /.genpack/ are whatever the image was built with, so none of
+        // them is opened through a symbolic link - an absolute link in an image would
+        // resolve on the host, and read a host file under the image's account - and none
+        // is opened in blocking mode, since a FIFO with no writer would stop vm before the
+        // VM starts.  Opening the directory once and the key relative to it puts the same
+        // limit on both levels of the path.
+        auto dirfd = open(dir.c_str(), O_RDONLY|O_CLOEXEC|O_DIRECTORY|O_NOFOLLOW);
+        if (dirfd < 0) {
+            if (errno == ENOENT) return std::nullopt; // an image with no /.genpack at all
+            problem = "open(" + dir.string() + ") failed: " + std::string(strerror(errno));
+            return std::nullopt;
+        }
+
+        auto path = dir / key;
+        // Says what is wrong with the key, and lets go of the directory only where this
+        // still holds it: closing one descriptor twice would release a descriptor that
+        // something else may have opened in the meantime.
+        auto fail = [&](const std::string& why) {
+            problem = path.string() + ": " + why;
+            return std::optional<std::string>();
+        };
+        auto fail_holding_dir = [&](const std::string& why) {
+            close(dirfd);
+            return fail(why);
+        };
+
+        struct stat st;
+        if (fstat(dirfd, &st) < 0) {
+            auto e = errno;
+            return fail_holding_dir(std::string("the directory holding it could not be examined: ") + strerror(e));
+        }
+        if (!S_ISDIR(st.st_mode)) return fail_holding_dir("the directory holding it is not a directory");
+
+        auto fd = openat(dirfd, key.c_str(), O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
+        close(dirfd);
+        if (fd < 0) {
+            if (errno == ENOENT) return std::nullopt; // this image has no such key
+            if (errno == ELOOP) return fail("is a symbolic link, which is not followed");
+            return fail(std::string("open failed: ") + strerror(errno));
+        }
+
+        if (fstat(fd, &st) < 0) {
+            auto e = errno;
+            close(fd);
+            return fail(std::string("could not be examined: ") + strerror(e));
+        }
+        if (!S_ISREG(st.st_mode)) {
+            close(fd);
+            return fail("is not a regular file");
+        }
+
+        std::string content;
+        char buffer[4096];
+        for (;;) {
+            auto r = read(fd, buffer, sizeof(buffer));
+            if (r == 0) break;
+            if (r < 0) {
+                auto e = errno;
+                close(fd);
+                return fail(std::string("read failed: ") + strerror(e));
+            }
+            content.append(buffer, r);
+        }
+        close(fd);
+        return content;
+    }
+
     std::optional<std::string> metadata::get(const std::string& key) const
     {
         auto found = cache.find(key);
         if (found != cache.end()) return found->second;
         //else
-        // A key genpack was not given when the image was built is simply not there,
-        // and an image that is not a genpack one has no /.genpack at all.
+        // A key genpack was not given when the image was built is simply not there, and an
+        // image that is not a genpack one has no /.genpack at all.  Those keys only describe
+        // the image and every caller can do without them, so one that cannot be reads the
+        // same way here; get_lines() reports it instead.
+        std::string problem;
+        auto content = read_key(key, problem);
         std::optional<std::string> value;
-        std::ifstream file(dir / key);
-        if (!file.fail()) {
-            auto content = std::string{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-            auto end = content.find_last_not_of(" \t\r\n");
-            if (end != std::string::npos) value = content.substr(0, end + 1);
+        if (content) {
+            auto end = content->find_last_not_of(" \t\r\n");
+            if (end != std::string::npos) value = content->substr(0, end + 1);
         }
         cache[key] = value;
         return value;
+    }
+
+    std::vector<std::string> metadata::get_lines(const std::string& key) const
+    {
+        // Only a key the image does not have reads as no entries.  One that is there but
+        // cannot be read is reported: quietly exporting nothing, and starting the VM
+        // anyway, is worse than refusing to start it.
+        std::string problem;
+        auto content = read_key(key, problem);
+        if (!content) {
+            if (!problem.empty()) throw std::runtime_error(problem);
+            return {};
+        }
+
+        std::vector<std::string> lines;
+        std::istringstream stream(*content);
+        std::string line;
+        while (std::getline(stream, line)) {
+            auto start = line.find_first_not_of(" \t\r");
+            if (start == std::string::npos) continue; // blank
+            auto end = line.find_last_not_of(" \t\r");
+            line = line.substr(start, end - start + 1);
+            if (line[0] == '#') continue;
+            lines.push_back(line);
+        }
+        return lines;
+    }
+
+    // The key an image declares its exported ports in, and the option that does the same
+    // from the command line: both are named in messages so that a reader can tell which
+    // one an export came from.
+    constexpr const char* vsock_exports_key = "/.genpack/vsock-exports";
+
+    vsock_export parse_vsock_export(const std::string& what, const std::string& text)
+    {
+        auto invalid = [&](const std::string& reason) {
+            return std::runtime_error("Invalid " + what + ": " + text + " (" + reason + ", expected PORT[:NAME])");
+        };
+
+        auto pos = text.find(':');
+        auto port_str = pos == std::string::npos? text : text.substr(0, pos);
+        auto name = pos == std::string::npos? port_str : text.substr(pos + 1);
+
+        uint32_t port = 0;
+        auto [ptr, ec] = std::from_chars(port_str.data(), port_str.data() + port_str.size(), port);
+        if (ec != std::errc{} || ptr != port_str.data() + port_str.size() || port == 0 || port == 0xFFFFFFFF/*VMADDR_PORT_ANY*/) {
+            throw invalid("port must be 1-4294967294");
+        }
+        if (name.empty() || name.size() > 64 || name.find_first_not_of('.') == std::string::npos
+            || name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") != std::string::npos) {
+            throw invalid("NAME must be 1-64 characters of [A-Za-z0-9._-]");
+        }
+        return {port, name, what + " " + text};
+    }
+
+    std::vector<vsock_export> declared_vsock_exports(const metadata& image)
+    {
+        std::vector<std::string> lines;
+        try {
+            lines = image.get_lines("vsock-exports");
+        } catch (const std::runtime_error& e) {
+            // The path get_lines names lives on a mount that is on its way out, so say
+            // which file of the image it was as well.
+            throw std::runtime_error(std::string("Failed to read ") + vsock_exports_key
+                + " of the system image: " + e.what());
+        }
+
+        std::vector<vsock_export> exports;
+        for (const auto& line : lines) {
+            exports.push_back(parse_vsock_export(vsock_exports_key, line));
+        }
+        return exports;
+    }
+
+    void check_vsock_exports(const std::vector<vsock_export>& exports)
+    {
+        // What was asked for from the command line has to name each name and each port
+        // once: one name twice would collide on the socket's file name, one port twice
+        // would relay the same guest port through two sockets.  The image's own
+        // declarations are checked by merge_vsock_exports() instead, because there the
+        // command line may cover for a duplicate; these are checked before any image is
+        // read, so every boot path sees them.
+        for (size_t i = 0; i < exports.size(); i++) {
+            for (size_t j = i + 1; j < exports.size(); j++) {
+                if (exports[i].name == exports[j].name)
+                    throw std::runtime_error("Duplicate --export-vsock name: " + exports[i].name);
+                if (exports[i].port == exports[j].port)
+                    throw std::runtime_error("Duplicate --export-vsock port: " + std::to_string(exports[i].port)
+                        + ", exported as both " + exports[i].name + " and " + exports[j].name);
+            }
+        }
+    }
+
+    std::vector<vsock_export> merge_vsock_exports(const std::vector<vsock_export>& requested,
+        const std::vector<vsock_export>& declared, std::vector<std::string>& notices)
+    {
+        // The same export can be listed in the file more than once.  That names one
+        // export, not two, and would say nothing twice, so the repeats go before
+        // anything is compared.
+        std::vector<vsock_export> unique;
+        for (const auto& e : declared) {
+            if (std::find_if(unique.begin(), unique.end(), [&](const vsock_export& m) {
+                    return m.port == e.port && m.name == e.name;}) == unique.end())
+                unique.push_back(e);
+        }
+
+        std::vector<vsock_export> merged = requested;
+
+        for (const auto& e : unique) {
+            auto port = std::find_if(merged.begin(), merged.end(),
+                [&](const vsock_export& m) {return m.port == e.port;});
+            if (port != merged.end()) {
+                // The command line wins for a port it mentions, whatever name either
+                // side gave it.  Whether an entry came from there is decided by where it
+                // sits: the command line's are the first ones, in the order given.
+                bool asked_for = port - merged.begin() < (ptrdiff_t)requested.size();
+                if (!asked_for)
+                    throw std::runtime_error(std::string(vsock_exports_key) + " exports port " + std::to_string(e.port)
+                        + " twice, as " + port->name + " and as " + e.name);
+                // Only worth saying when the command line renamed the export: the image
+                // asking for what was asked for is the image agreeing with itself.
+                if (port->name != e.name)
+                    notices.push_back(std::string(vsock_exports_key) + " asks for " + std::to_string(e.port) + ":"
+                        + e.name + ", overridden by " + port->source);
+                continue;
+            }
+            auto name = std::find_if(merged.begin(), merged.end(),
+                [&](const vsock_export& m) {return m.name == e.name;});
+            if (name != merged.end()) {
+                throw std::runtime_error(std::string(vsock_exports_key) + " exports port " + std::to_string(e.port)
+                    + " as " + e.name + ", the name port " + std::to_string(name->port) + " is exported as ("
+                    + name->source + ")");
+            }
+            merged.push_back(e);
+        }
+
+        return merged;
     }
 
     boot_files find_boot_files(const std::filesystem::path& ro_root, const std::filesystem::path& unpack_dir)

@@ -180,32 +180,9 @@ static std::pair<std::filesystem::path,std::string> parse_9p(const std::string& 
     return {str.substr(0, pos), str.substr(pos + 1)};
 }
 
-struct VsockExport {
-    uint32_t port;
-    std::string name;
-};
-
-static VsockExport parse_vsock_export(const std::string& str)
-{
-    auto invalid = [&](const std::string& reason) {
-        return std::runtime_error("Invalid --export-vsock: " + str + " (" + reason + ", expected PORT[:NAME])");
-    };
-
-    auto pos = str.find(':');
-    auto port_str = pos == std::string::npos? str : str.substr(0, pos);
-    auto name = pos == std::string::npos? port_str : str.substr(pos + 1);
-
-    uint32_t port = 0;
-    auto [ptr, ec] = std::from_chars(port_str.data(), port_str.data() + port_str.size(), port);
-    if (ec != std::errc{} || ptr != port_str.data() + port_str.size() || port == 0 || port == 0xFFFFFFFF/*VMADDR_PORT_ANY*/) {
-        throw invalid("port must be 1-4294967294");
-    }
-    if (name.empty() || name.size() > 64 || name.find_first_not_of('.') == std::string::npos
-        || name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") != std::string::npos) {
-        throw invalid("NAME must be 1-64 characters of [A-Za-z0-9._-]");
-    }
-    return {port, name};
-}
+// A vsock port exposed on the host, in the PORT[:NAME] syntax of --export-vsock; the
+// image asks for the same thing in /.genpack/vsock-exports (see system_image.h).
+using system_image::vsock_export;
 
 struct RunOptions {
     const std::optional<std::string>& name = std::nullopt;
@@ -218,7 +195,10 @@ struct RunOptions {
     const std::vector<std::string> hostfwd = {};
     const std::vector<std::string> guestfwd = {};
     const std::vector<std::filesystem::path> sock_forward = {};
-    const std::vector<VsockExport> export_vsock = {};
+    const std::vector<vsock_export> export_vsock = {};
+    // An image may declare the ports it exports itself, in /.genpack/vsock-exports;
+    // --no-auto-vsock-exports (and auto-vsock-exports=false in vm.ini) says otherwise.
+    const bool auto_vsock_exports = true;
     const std::vector<std::filesystem::path>& usb = {};
     const std::vector<std::tuple<std::filesystem::path,bool/*virtio*/,std::optional<std::string>/*serial*/>>& disks = {};
     const std::vector<std::tuple<std::string,bool,bool,std::optional<std::string>>>& pci = {};
@@ -905,7 +885,7 @@ static int run_qemu(const std::string& vmname, const std::vector<std::string>& c
 // Expose guest vsock ports as Unix domain sockets on the host, under
 // $XDG_RUNTIME_DIR/vm/<vmname>/vsock/<name>.sock (the reverse direction of --sock-forward).
 static void spawn_vsock_exports(const std::string& vmname, uint32_t guest_cid,
-                                const std::vector<VsockExport>& exports, qemu_os_resources& os_resources)
+                                const std::vector<vsock_export>& exports, qemu_os_resources& os_resources)
 {
     auto dir = run_dir::vsock_dir(vmname);
     // Sockets left behind by a VM that was killed (SIGKILL prevents socat from
@@ -919,7 +899,7 @@ static void spawn_vsock_exports(const std::string& vmname, uint32_t guest_cid,
         auto socket_name = e.name + ".sock";
         auto path = dir / socket_name;
         auto pid = vsock::run_vsock_export(guest_cid, e.port, dir, socket_name);
-        os_resources.proxies.push_back({pid, "--export-vsock " + std::to_string(e.port) + ":" + e.name});
+        os_resources.proxies.push_back({pid, e.source});
 
         // exec succeeding is not enough: socat can still fail to bind. Wait for
         // the socket to appear so that such a failure is reported here instead of
@@ -944,7 +924,7 @@ static void spawn_vsock_exports(const std::string& vmname, uint32_t guest_cid,
             throw std::runtime_error("Failed to export vsock port " + std::to_string(e.port)
                 + " as " + path.string() + ": the socket did not appear");
         }
-        std::cout << "Exporting vsock port " << e.port << " as " << path.string() << std::endl;
+        std::cout << "Exporting vsock port " << e.port << " as " << path.string() << " (" << e.source << ")" << std::endl;
     }
 }
 
@@ -999,6 +979,22 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
     // what the image can be booted with, read through the scratch mount so that a
     // bad image is reported before anything has been started
     auto boot = system_image::find_boot_files(image_root, unpack_dir);
+
+    // What the image asks to be reachable on the host: one PORT[:NAME] per line of
+    // /.genpack/vsock-exports, the syntax --export-vsock uses.  This is read here, off
+    // the mount whose purpose is reading the image, and turned into plain data before
+    // anything is started: metadata caches a miss just as it caches a hit, so asking for
+    // the key after the scratch mount is gone would read as though the image had no such
+    // file, and the mount that lives as long as the VM is only made after the --detach
+    // fork, by the process that goes on to run QEMU.  A line the image got wrong is
+    // reported here, where the message is a normal one, rather than as a VM that failed
+    // to start.
+    std::vector<vsock_export> declared;
+    if (genpack && options.auto_vsock_exports) declared = system_image::declared_vsock_exports(*genpack);
+    std::vector<std::string> notices;
+    auto exports = system_image::merge_vsock_exports(options.export_vsock, declared, notices);
+    for (const auto& notice : notices) std::cout << notice << std::endl;
+
     if (mount_system_image) {
         // the guarantee that a mount cannot outlive the process that made it,
         // checked on the mount that has just been read from
@@ -1233,7 +1229,7 @@ static int run(const std::optional<std::filesystem::path>& system_file, const st
 
     if (virtiofsd_pid > 0) os_resources.virtiofsd_pid = virtiofsd_pid;
 
-    spawn_vsock_exports(vmname, guest_cid, options.export_vsock, os_resources);
+    spawn_vsock_exports(vmname, guest_cid, exports, os_resources);
 
     uint32_t port_offset = 0;
     for (const auto& path : options.sock_forward) {
@@ -1504,6 +1500,9 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
 
     bool qga = iniparser_getboolean(ini.get(), ":qga", 1);
     bool uefi = iniparser_getboolean(ini.get(), ":uefi", 1);
+    // An image that declares the ports it exports in /.genpack/vsock-exports gets them
+    // exported on the host as well; a VM that does not want that says so here.
+    bool auto_vsock_exports = (bool)iniparser_getboolean(ini.get(), ":auto-vsock-exports", 1);
 
     if (type == "genpack") {
         return run(system_file, data_file, swap_file, {
@@ -1513,6 +1512,7 @@ static int service(const std::string& vmname, const std::filesystem::path& vm_di
                 .cpus = cpus,
                 .net = net,
                 .hostfwd = hostfwd,
+                .auto_vsock_exports = auto_vsock_exports,
                 .usb = usb,
                 .disks = disks,
                 .pci = pci,
@@ -1912,6 +1912,7 @@ static int _main(int argc, char* argv[])
     run_command.add_argument("--guestfwd").help("pass guestfwd to QEMU").append();
     run_command.add_argument("--sock-forward").help("forward vsock port to host Unix domain socket").append();
     run_command.add_argument("--export-vsock").help("expose guest vsock port as host Unix domain socket (PORT[:NAME])").append();
+    run_command.add_argument("--no-auto-vsock-exports").default_value(false).implicit_value(true).help("ignore the ports the system image declares in /.genpack/vsock-exports");
     run_command.add_argument("--virtiofs-path").nargs(1);
     run_command.add_argument("--no-kvm").default_value(false).implicit_value(true);
     run_command.add_argument("--append").nargs(1);
@@ -2079,18 +2080,11 @@ static int _main(int argc, char* argv[])
             sock_forward.push_back(s);
         }
 
-        std::vector<VsockExport> export_vsock;
+        std::vector<vsock_export> export_vsock;
         for (const auto& s : run_command.get<std::vector<std::string>>("--export-vsock")) {
-            export_vsock.push_back(parse_vsock_export(s));
+            export_vsock.push_back(system_image::parse_vsock_export("--export-vsock", s));
         }
-        {
-            std::set<std::string> names;
-            for (const auto& e : export_vsock) {
-                if (!names.insert(e.name).second) {
-                    throw std::runtime_error("Duplicate --export-vsock name: " + e.name);
-                }
-            }
-        }
+        system_image::check_vsock_exports(export_vsock);
 
         std::vector<std::filesystem::path> usb = run_command.present("--usb")?
             query_usb_devices(run_command.get<std::string>("--usb")) : std::vector<std::filesystem::path>();
@@ -2165,6 +2159,7 @@ static int _main(int argc, char* argv[])
                 .guestfwd = guestfwd,
                 .sock_forward = sock_forward,
                 .export_vsock = export_vsock,
+                .auto_vsock_exports = !run_command.get<bool>("--no-auto-vsock-exports"),
                 .usb = usb,
                 .pci = pci,
                 .cdrom = run_command.present("--cdrom"),

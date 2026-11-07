@@ -1,7 +1,10 @@
+#include <cstdint>
 #include <filesystem>
 #include <map>
 #include <optional>
 #include <string>
+#include <vector>
+
 #include <sys/types.h>
 
 namespace system_image {
@@ -75,10 +78,55 @@ namespace system_image {
         std::optional<std::string> commit_id() const {return get("commit-id");}
         std::optional<std::string> timestamp_commit() const {return get("timestamp.commit");}
 
+        // A key holding one entry per line (vsock-exports).  Blank lines and lines
+        // starting with # are skipped, so the file can carry comments.  Unlike get(), a
+        // key that is there but cannot be read is an error rather than an empty result:
+        // only a missing file means the image declares nothing.
+        std::vector<std::string> get_lines(const std::string& key) const;
+
     private:
+        // Opens and reads one key under dir.  Nothing is opened through a symbolic link
+        // and nothing is opened in blocking mode, because every name under /.genpack/ is
+        // the image's choice: a link would resolve on the host, and a FIFO with no writer
+        // would stop vm before it starts the VM.  std::nullopt means the key is not there
+        // when problem is empty, and that it could not be read when it is not; whether
+        // that is an error is the caller's, not this function's.
+        std::optional<std::string> read_key(const std::string& key, std::string& problem) const;
+
         std::filesystem::path dir;
         mutable std::map<std::string, std::optional<std::string>> cache;
     };
+
+    // A vsock port to expose on the host.  PORT[:NAME] is the syntax of vm's
+    // --export-vsock option, and also the syntax of a line of an image's
+    // /.genpack/vsock-exports.
+    struct vsock_export {
+        uint32_t port;
+        std::string name;
+        std::string source; // what asked for it, named when its proxy fails or dies
+    };
+
+    // Parses one PORT[:NAME].  what says where the text came from, so that the message
+    // says so too ("--export-vsock", or the file for a line read out of an image).
+    vsock_export parse_vsock_export(const std::string& what, const std::string& text);
+
+    // The ports an image asks to be reachable on the host, from
+    // /.genpack/vsock-exports.  An image that declares nothing has no such file, which
+    // is not an error; one that has the file but cannot be read is.
+    std::vector<vsock_export> declared_vsock_exports(const metadata& image);
+
+    // Refuses a list of exports - the ones asked for on the command line - that names one
+    // port twice, or one name twice.  Called before any image is read, so every boot path
+    // sees it, and merge_vsock_exports() can take the command line's list to be unique.
+    void check_vsock_exports(const std::vector<vsock_export>& requested);
+
+    // Combines what was asked for on the command line with what the image declares.
+    // The command line wins: a port it mentions is not exported a second time from the
+    // image.  The same export listed twice in the file is one export, not two, but two
+    // different exports cannot share a name (that is the socket's file name) or a port.
+    // notices says what was dropped, so that the caller can say it out loud.
+    std::vector<vsock_export> merge_vsock_exports(const std::vector<vsock_export>& requested,
+        const std::vector<vsock_export>& declared, std::vector<std::string>& notices);
 
     struct boot_files {
         std::filesystem::path kernel;

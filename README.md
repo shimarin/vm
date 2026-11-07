@@ -66,6 +66,30 @@ host, and relays every connection accepted there to the guest's vsock port
 (`<guest cid>:1158923571` / `<guest cid>:80`). The port is used literally and must be
 1-4294967294; the optional `NAME` defaults to the port number and must match `[A-Za-z0-9._-]{1,64}`.
 
+An image can name the ports it exports itself. A genpack image may carry
+
+    /.genpack/vsock-exports
+
+holding one `PORT[:NAME]` per line - the same syntax, with blank lines and `#` comments
+ignored - and `vm run` exports those too, reading the file while it reads the image for its
+name and its kernel:
+
+    Exporting vsock port 3080 as /run/user/1000/vm/librechat/vsock/librechat.sock (/.genpack/vsock-exports 3080:librechat)
+
+The command line wins for a port it mentions: `--export-vsock 3080:web` replaces what the
+image declared as `3080:librechat` and says so. The same line listed twice is exported once,
+and two different exports cannot share a name, which is the socket's file name, or a port -
+an image that gets either wrong is reported before QEMU starts, like a bad kernel is. The
+command line is held to the same rule: `--export-vsock 80:a --export-vsock 80:b` is refused
+too, whether the image declares anything or not. A declaration that is there but is not a
+readable regular file - a symbolic link, a directory, a FIFO, or a read that failed - is an
+error as well, and nothing under `/.genpack/` is opened through a link: following one would
+read a host file under the image's account and export sockets from its contents. Only an
+image without the file declares nothing.
+`--no-auto-vsock-exports` ignores the file, as does
+`auto-vsock-exports = false` in `vm.ini`. Only the direct kernel boot path reads the image
+this way: `--bios`, and a directory given instead of an image, take `--export-vsock` alone.
+
 `vm show myvm` lists the sockets while the VM is running:
 
     "vsock_exports": {
