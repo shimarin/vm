@@ -20,6 +20,12 @@ namespace run_dir {
     inline auto qga_lock(const std::string& vmname) {return vm_dir(vmname) / "qga.lock";}
     inline auto virtiofs_sock(const std::string& vmname) {return vm_dir(vmname) / "virtiofs.sock";}
     inline auto vsock_dir(const std::string& vmname) {return vm_dir(vmname) / "vsock";}
+
+    // the read-only mount of the system image, and the directory unpacked boot
+    // files (a gzipped kernel) are written to
+    inline auto ro_dir(const std::string& vmname) {return vm_dir(vmname) / "ro";}
+    inline auto boot_dir(const std::string& vmname) {return vm_dir(vmname) / "boot";}
+
     inline auto iommu_mem(const std::string& vmname) {return vm_dir(vmname) / "iommu-mem";}
 
     template <typename T>
